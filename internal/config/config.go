@@ -54,7 +54,6 @@ type Config struct {
 	Verbose                    bool   `mapstructure:"verbose"`
 	Ngrok                      bool   `mapstructure:"ngrok"`
 	NgrokURL                   string `mapstructure:"ngrok_url"`
-	TraceDir                   string `mapstructure:"trace_dir"`
 	MaxConcurrentRequests      int    `mapstructure:"max_concurrent_requests"`
 	OTelEndpoint               string `mapstructure:"otel_endpoint"`
 	OTelServiceName            string `mapstructure:"otel_service_name"`
@@ -230,7 +229,6 @@ solving compatibility issues with DeepSeek's thinking-mode tool-call API.`,
 	rootCmd.Flags().Bool("verbose", defaultVerbose, "Log detailed request information")
 	rootCmd.Flags().Bool("ngrok", defaultNgrok, "Start an ngrok tunnel")
 	rootCmd.Flags().String("ngrok-url", "", "Reserved ngrok endpoint / custom domain")
-	rootCmd.Flags().String("trace-dir", "", "Write structured request traces to directory")
 	rootCmd.Flags().String("otel-endpoint", "", "OpenTelemetry OTLP gRPC endpoint (e.g. host.docker.internal:4317)")
 	rootCmd.Flags().String("otel-service-name", "deepseek-cursor-proxy-go", "OpenTelemetry service name")
 	// Note: OTel flags are NOT bound to Viper to avoid pflag defaults overriding env vars.

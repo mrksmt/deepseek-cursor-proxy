@@ -13,26 +13,23 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v5"
 	echo_otel "github.com/labstack/echo-opentelemetry"
 	"github.com/labstack/echo/v5"
 	"github.com/labstack/echo/v5/middleware"
+	"github.com/mrksmt/deepseek-cursor-proxy/internal/config"
+	"github.com/mrksmt/deepseek-cursor-proxy/internal/models"
+	"github.com/mrksmt/deepseek-cursor-proxy/internal/otel_ctx"
+	"github.com/mrksmt/deepseek-cursor-proxy/internal/store"
+	"github.com/mrksmt/deepseek-cursor-proxy/internal/streaming"
+	"github.com/mrksmt/deepseek-cursor-proxy/internal/transform"
+	"github.com/mrksmt/deepseek-cursor-proxy/internal/tunnel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	otel_trace "go.opentelemetry.io/otel/trace"
-
-	"github.com/mrksmt/deepseek-cursor-proxy/internal/config"
-	"github.com/mrksmt/deepseek-cursor-proxy/internal/models"
-	"github.com/mrksmt/deepseek-cursor-proxy/internal/store"
-	"github.com/mrksmt/deepseek-cursor-proxy/internal/streaming"
-	"github.com/mrksmt/deepseek-cursor-proxy/internal/trace"
-	"github.com/mrksmt/deepseek-cursor-proxy/internal/transform"
-	"github.com/mrksmt/deepseek-cursor-proxy/internal/tunnel"
 )
 
 const serverVersion = "DeepSeekGoProxy/0.1"
-
-// context key for storing the TraceRequest
-type traceRequestKey struct{}
 
 // httpError wraps an HTTP status code with a message for centralized response writing.
 type httpError struct {
@@ -42,33 +39,16 @@ type httpError struct {
 
 func (e *httpError) Error() string { return e.Message }
 
-// writeError writes a JSON error response from an *httpError, finishes
-// the trace, and logs the rejection.
-func writeError(ctx context.Context, c *echo.Context, err error) error {
+// writeError writes a JSON error response from an *httpError and logs the rejection.
+func writeError(c *echo.Context, err error) error {
 	var he *httpError
 	if !errors.As(err, &he) {
 		he = &httpError{Code: http.StatusInternalServerError, Message: err.Error()}
 	}
 	log.Printf("rejected request status=%d reason=%s", he.Code, he.Message)
-	getTraceRequest(ctx).Finish("rejected", map[string]any{"http_status": he.Code})
 	return c.JSON(he.Code, models.ErrorResponse{
 		Error: models.ErrorDetail{Message: he.Message},
 	})
-}
-
-func withTraceRequest(ctx context.Context, tr trace.TraceRequestInterface) context.Context {
-	if tr == nil {
-		tr = trace.NoopTraceRequest{}
-	}
-	return context.WithValue(ctx, traceRequestKey{}, tr)
-}
-
-func getTraceRequest(ctx context.Context) trace.TraceRequestInterface {
-	tr, _ := ctx.Value(traceRequestKey{}).(trace.TraceRequestInterface)
-	if tr == nil {
-		return trace.NoopTraceRequest{}
-	}
-	return tr
 }
 
 // ProxyServer wraps the Echo server with proxy-specific state.
@@ -77,26 +57,20 @@ type ProxyServer struct {
 	httpServer     *http.Server
 	cfg            *config.Config
 	reasoningStore *store.ReasoningStore
-	traceWriter    *trace.TraceWriter
 	ngrokTunnel    *tunnel.NgrokTunnel
-
-	tracer     otel_trace.Tracer
-	httpClient *http.Client
+	httpClient     *http.Client
+	circuitBreaker circuitBreaker
 }
 
 // NewProxyServer creates a new proxy server.
 func NewProxyServer(
 	cfg *config.Config,
 	rs *store.ReasoningStore,
-	tw *trace.TraceWriter,
-	otelTracer *trace.OTelTracer,
 ) *ProxyServer {
 
 	s := &ProxyServer{
 		cfg:            cfg,
 		reasoningStore: rs,
-		traceWriter:    tw,
-		tracer:         otelTracer.Tracer(),
 		httpClient:     &http.Client{Timeout: time.Duration(cfg.RequestTimeout) * time.Second},
 	}
 
@@ -104,6 +78,7 @@ func NewProxyServer(
 
 	// e.Use(middleware.Recover())
 	e.Use(echo_otel.NewMiddleware("deepseek-cursor-proxy"))
+	e.Use(injectTracerMiddleware())
 
 	if cfg.CORS {
 		e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
@@ -142,9 +117,30 @@ func (s *ProxyServer) Start(
 	return s.httpServer.ListenAndServe()
 }
 
-// Shutdown gracefully shuts down the server.
+// Shutdown gracefully shuts down all server components in order:
+// 1. HTTP server (drains in-flight requests)
+// 2. Ngrok tunnel
+// 3. Reasoning store (flushes SQLite batch)
 func (s *ProxyServer) Shutdown(ctx context.Context) error {
-	return s.httpServer.Shutdown(ctx)
+	// 1. Stop accepting new requests, drain in-flight
+	var firstErr error
+	if err := s.httpServer.Shutdown(ctx); err != nil {
+		firstErr = fmt.Errorf("http shutdown: %w", err)
+	}
+
+	// 2. Stop ngrok tunnel
+	if s.ngrokTunnel != nil {
+		s.ngrokTunnel.Stop()
+	}
+
+	// 3. Close reasoning store
+	if s.reasoningStore != nil {
+		if err := s.reasoningStore.Close(ctx); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("store close: %w", err)
+		}
+	}
+
+	return firstErr
 }
 
 // ---------------------------------------------------------------------------
@@ -181,64 +177,50 @@ func (s *ProxyServer) handleModels(c *echo.Context) error {
 func (s *ProxyServer) handleChatCompletions(c *echo.Context) (err error) {
 
 	ctx := c.Request().Context()
-	ctx, span := s.tracer.Start(ctx, "handleChatCompletions")
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "handleChatCompletions")
 	defer span.End()
 
-	// Catch panics so they are recorded on the span and finishTrace is called.
+	// Catch panics so they are recorded on the span.
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v", r)
 			log.Printf("recovered panic in handleChatCompletions: %v", r)
 			span.RecordError(fmt.Errorf("%v", r))
 			span.SetStatus(codes.Error, fmt.Sprintf("%v", r))
-			getTraceRequest(ctx).Finish("panic", map[string]any{"error": fmt.Sprintf("%v", r)})
 		}
 	}()
 
-	reqPath := c.Path()
-
-	tr := s.startTrace(c.Request(), reqPath)
-	ctx = withTraceRequest(ctx, tr)
-
-	token, err := s.checkAuthorization(ctx, c.Request())
+	token, err := s.checkAuthorization(c.Request().Header)
 	if err != nil {
-		return writeError(ctx, c, err)
+		return writeError(c, err)
 	}
 
 	payload, err := s.readAndParseBody(ctx, c.Request())
 	if err != nil {
-		return writeError(ctx, c, err)
+		return writeError(c, err)
 	}
-
-	getTraceRequest(ctx).RecordCursorBody(payload)
 
 	prepared, err := s.prepareUpstream(ctx, payload, token)
 	if err != nil {
-		return writeError(ctx, c, err)
+		return writeError(c, err)
 	}
 
 	upReq, upstreamBody, isStream, err := s.buildUpstreamRequest(ctx, c.Request(), prepared, token)
 	if err != nil {
-		return writeError(ctx, c, err)
+		return writeError(c, err)
 	}
 
-	otel_trace.SpanFromContext(ctx).SetAttributes(
+	span.AddEvent("upstream.request", otel_trace.WithAttributes(
 		attribute.Bool("stream", isStream),
-	)
-	otel_trace.SpanFromContext(ctx).AddEvent("upstream.body", otel_trace.WithAttributes(attribute.Int("size", len(upstreamBody))))
-
-	getTraceRequest(ctx).RecordUpstreamRequest(
-		fmt.Sprintf("%s/chat/completions", s.cfg.UpstreamBaseURL),
-		headerMap(upReq.Header),
-		len(upstreamBody),
-	)
+		attribute.Int("body_size", len(upstreamBody)),
+	))
 
 	upResp, err := s.doUpstream(ctx, upReq, prepared.UpstreamModel)
 	if err != nil {
-		return writeError(ctx, c, err)
+		return writeError(c, err)
 	}
 	if upResp == nil {
-		return writeError(ctx, c, &httpError{
+		return writeError(c, &httpError{
 			Code:    http.StatusBadGateway,
 			Message: "Upstream returned nil response",
 		})
@@ -250,11 +232,7 @@ func (s *ProxyServer) handleChatCompletions(c *echo.Context) (err error) {
 		return nil
 	}
 
-	streamVal := isStream
-	getTraceRequest(ctx).RecordUpstreamResponse(upResp.StatusCode, responseHeaders(upResp), nil, &streamVal)
-
 	result := s.proxyResponse(ctx, c.Response(), upResp, prepared, isStream)
-	s.finishTrace(ctx, result, upResp.StatusCode, isStream)
 
 	span.SetAttributes(
 		attribute.String("upstream_model", prepared.UpstreamModel),
@@ -273,6 +251,20 @@ func (s *ProxyServer) handleChatCompletions(c *echo.Context) (err error) {
 // ---------------------------------------------------------------------------
 // Middleware
 // ---------------------------------------------------------------------------
+
+// injectTracerMiddleware copies the echo-opentelemetry tracer into request.Context
+// so handlers and downstream code can use otelctx.Tracer(ctx).
+func injectTracerMiddleware() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c *echo.Context) error {
+			if t, ok := c.Get(echo_otel.TracerKey).(otel_trace.Tracer); ok {
+				ctx := otel_ctx.WithTracer(c.Request().Context(), t)
+				c.SetRequest(c.Request().WithContext(ctx))
+			}
+			return next(c)
+		}
+	}
+}
 
 // concurrencyLimiter returns a middleware that limits the number of concurrent
 // in-flight requests. When the limit is reached, new requests receive 429.
@@ -300,27 +292,11 @@ func concurrencyLimiter(limit int) echo.MiddlewareFunc {
 // Request pipeline steps
 // ---------------------------------------------------------------------------
 
-// startTrace begins tracing the request if a trace writer is configured.
-func (s *ProxyServer) startTrace(r *http.Request, reqPath string) trace.TraceRequestInterface {
-	if s.traceWriter == nil {
-		return trace.NoopTraceRequest{}
-	}
-	return s.traceWriter.StartRequest(
-		r.Method,
-		reqPath,
-		r.RemoteAddr,
-		headerMap(r.Header),
-	)
-}
-
-// checkAuthorization extracts and validates the Bearer token.
-// Returns the token on success.
 func (s *ProxyServer) checkAuthorization(
-	ctx context.Context,
-	r *http.Request,
+	header http.Header,
 ) (string, error) {
 
-	token := extractBearerToken(r.Header.Get("Authorization"))
+	token := extractBearerToken(header.Get("Authorization"))
 	if token == "" {
 		return "", &httpError{
 			Code:    http.StatusUnauthorized,
@@ -337,7 +313,7 @@ func (s *ProxyServer) readAndParseBody(
 	r *http.Request,
 ) (map[string]any, error) {
 
-	ctx, span := s.tracer.Start(ctx, "readAndParseBody")
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "readAndParseBody")
 	defer span.End()
 
 	limited := io.LimitReader(r.Body, s.cfg.MaxRequestBodyBytes+1)
@@ -345,11 +321,13 @@ func (s *ProxyServer) readAndParseBody(
 	decoder := json.NewDecoder(limited)
 	if err := decoder.Decode(&payload); err != nil {
 		if decoder.InputOffset() > s.cfg.MaxRequestBodyBytes {
+			span.SetStatus(codes.Error, "request too large")
 			return nil, &httpError{
 				Code:    http.StatusRequestEntityTooLarge,
 				Message: fmt.Sprintf("Request body too large; limit is %d bytes", s.cfg.MaxRequestBodyBytes),
 			}
 		}
+		span.SetStatus(codes.Error, fmt.Sprintf("invalid JSON: %v", err))
 		return nil, &httpError{
 			Code:    http.StatusBadRequest,
 			Message: fmt.Sprintf("Invalid JSON: %v", err),
@@ -370,7 +348,8 @@ func (s *ProxyServer) prepareUpstream(
 	payload map[string]any,
 	token string,
 ) (*models.PreparedRequest, error) {
-	ctx, span := s.tracer.Start(ctx, "prepareUpstream")
+
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "prepareUpstream")
 	defer span.End()
 
 	prepared := transform.PrepareUpstreamRequest(ctx, payload, s.cfg, s.reasoningStore, token)
@@ -386,6 +365,7 @@ func (s *ProxyServer) prepareUpstream(
 	))
 
 	if prepared.MissingReasoningMessages > 0 && s.cfg.MissingReasoningStrategy == "reject" {
+		span.SetStatus(codes.Error, fmt.Sprintf("missing reasoning rejected for %d messages", prepared.MissingReasoningMessages))
 		return nil, &httpError{
 			Code: http.StatusConflict,
 			Message: fmt.Sprintf(
@@ -413,11 +393,12 @@ func (s *ProxyServer) buildUpstreamRequest(
 	isStream bool,
 	err error,
 ) {
-	ctx, span := s.tracer.Start(ctx, "buildUpstreamRequest")
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "buildUpstreamRequest")
 	defer span.End()
 
 	buf := new(bytes.Buffer)
 	if err := json.NewEncoder(buf).Encode(prepared.Payload); err != nil {
+		span.SetStatus(codes.Error, "payload marshal failed")
 		return nil, nil, false, &httpError{
 			Code:    http.StatusInternalServerError,
 			Message: "Internal error preparing request",
@@ -435,6 +416,7 @@ func (s *ProxyServer) buildUpstreamRequest(
 		buf,
 	)
 	if err != nil {
+		span.SetStatus(codes.Error, "failed to create upstream request")
 		return nil, nil, false, &httpError{
 			Code:    http.StatusInternalServerError,
 			Message: "Internal error creating upstream request",
@@ -464,7 +446,7 @@ func (s *ProxyServer) doUpstream(
 	upstreamModel string,
 ) (*http.Response, error) {
 
-	ctx, span := s.tracer.Start(ctx, "doUpstream")
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "doUpstream")
 	defer span.End()
 
 	span.SetAttributes(
@@ -473,6 +455,7 @@ func (s *ProxyServer) doUpstream(
 
 	upResp, err := s.upstreamRoundTrip(ctx, upReq)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return nil, &httpError{
 			Code:    http.StatusBadGateway,
 			Message: fmt.Sprintf("Upstream request failed: %v", err),
@@ -482,23 +465,59 @@ func (s *ProxyServer) doUpstream(
 	return upResp, nil
 }
 
-// upstreamRoundTrip executes the upstream HTTP request and returns the response.
+// upstreamRoundTrip executes the upstream HTTP request with retries (via exponential backoff)
+// and circuit breaker. Only 5xx responses trigger retries; transport errors also retry.
 func (s *ProxyServer) upstreamRoundTrip(
 	ctx context.Context,
 	upReq *http.Request,
 ) (*http.Response, error) {
-	ctx, span := s.tracer.Start(ctx, "upstreamRoundTrip")
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "upstreamRoundTrip")
 	defer span.End()
 
 	if s.httpClient == nil {
 		return nil, fmt.Errorf("http client is nil")
 	}
 
-	upResp, err := s.httpClient.Do(upReq)
-	if err != nil {
+	// Circuit breaker: fast-fail if open
+	if err := s.circuitBreaker.allow(); err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
-	return upResp, nil
+
+	b := backoff.NewExponentialBackOff()
+	b.InitialInterval = 500 * time.Millisecond
+	b.MaxInterval = 5 * time.Second
+
+	result, err := backoff.Retry(
+		ctx,
+		func() (*http.Response, error) {
+			upResp, err := s.httpClient.Do(upReq)
+			if err != nil {
+				// Transport error (timeout, DNS, connection reset) — retriable
+				span.AddEvent("upstream.retry",
+					otel_trace.WithAttributes(attribute.String("reason", err.Error())))
+				return nil, err
+			}
+			if upResp.StatusCode >= 500 {
+				// 5xx — retriable; drain body before retrying
+				io.Copy(io.Discard, upResp.Body)
+				upResp.Body.Close()
+				span.AddEvent("upstream.retry",
+					otel_trace.WithAttributes(attribute.Int("status", upResp.StatusCode)))
+				return nil, fmt.Errorf("upstream %d", upResp.StatusCode)
+			}
+			// 4xx or success — non-retriable
+			return upResp, nil
+		},
+		backoff.WithBackOff(b),
+	)
+
+	if err != nil {
+		s.circuitBreaker.failure()
+		return nil, err
+	}
+	s.circuitBreaker.success()
+	return result, nil
 }
 
 // handleUpstreamError reads and forwards an error response from the upstream.
@@ -507,7 +526,7 @@ func (s *ProxyServer) handleUpstreamError(
 	w http.ResponseWriter,
 	upResp *http.Response,
 ) {
-	ctx, span := s.tracer.Start(ctx, "handleUpstreamError")
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "handleUpstreamError")
 	defer span.End()
 
 	if upResp == nil {
@@ -517,8 +536,8 @@ func (s *ProxyServer) handleUpstreamError(
 	}
 
 	bodyBytes, _ := io.ReadAll(upResp.Body)
-	getTraceRequest(ctx).RecordUpstreamResponse(upResp.StatusCode, responseHeaders(upResp), bodyBytes, nil)
 	log.Printf("upstream error status=%d", upResp.StatusCode)
+	span.SetStatus(codes.Error, fmt.Sprintf("upstream returned %d", upResp.StatusCode))
 	w.Header().Set(echo.HeaderContentType, "application/json")
 	w.WriteHeader(upResp.StatusCode)
 	w.Write(bodyBytes)
@@ -532,35 +551,13 @@ func (s *ProxyServer) proxyResponse(
 	prepared *models.PreparedRequest,
 	stream bool,
 ) *proxyResponseResult {
-	ctx, span := s.tracer.Start(ctx, "proxyResponse")
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "proxyResponse")
 	defer span.End()
 
 	if stream {
 		return s.proxyStreamingResponse(ctx, w, upResp, prepared)
 	}
 	return s.proxyRegularResponse(ctx, w, upResp, prepared)
-}
-
-// finishTrace completes the trace with the final status and metadata.
-func (s *ProxyServer) finishTrace(
-	ctx context.Context,
-	result *proxyResponseResult,
-	statusCode int,
-	stream bool,
-) {
-	tr := getTraceRequest(ctx)
-	status := "completed"
-	if result != nil && !result.sent {
-		status = "client_disconnected"
-	}
-	extra := map[string]any{
-		"http_status": statusCode,
-		"stream":      stream,
-	}
-	if result != nil && result.usage != nil {
-		extra["usage"] = result.usage
-	}
-	tr.Finish(status, extra)
 }
 
 // ---------------------------------------------------------------------------
@@ -632,7 +629,7 @@ func (s *ProxyServer) proxyRegularResponse(
 	upResp *http.Response,
 	prepared *models.PreparedRequest,
 ) *proxyResponseResult {
-	ctx, span := s.tracer.Start(ctx, "proxyRegularResponse")
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "proxyRegularResponse")
 	defer span.End()
 
 	if upResp == nil || upResp.Body == nil {
@@ -684,7 +681,7 @@ func (s *ProxyServer) proxyStreamingResponse(
 	prepared *models.PreparedRequest,
 ) *proxyResponseResult {
 
-	ctx, span := s.tracer.Start(ctx, "proxyStreamingResponse")
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "proxyStreamingResponse")
 	defer span.End()
 
 	w.Header().Set(echo.HeaderContentType, "text/event-stream")
@@ -737,7 +734,7 @@ func (s *ProxyServer) readUpstreamStream(
 	finalized *bool,
 ) *proxyResponseResult {
 
-	ctx, span := s.tracer.Start(ctx, "readUpstreamStream")
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "readUpstreamStream")
 	defer span.End()
 
 	var (
@@ -799,7 +796,7 @@ func (s *ProxyServer) cleanupStreamingBatch(
 	cacheNamespace string,
 	finalized *bool,
 ) {
-	ctx, span := s.tracer.Start(ctx, "cleanupStreamingBatch")
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "cleanupStreamingBatch")
 	defer span.End()
 
 	var tStoreReasoning time.Duration

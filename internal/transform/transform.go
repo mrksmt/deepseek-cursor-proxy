@@ -9,11 +9,11 @@ import (
 	"regexp"
 	"strings"
 
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/mrksmt/deepseek-cursor-proxy/internal/config"
 	"github.com/mrksmt/deepseek-cursor-proxy/internal/models"
+	"github.com/mrksmt/deepseek-cursor-proxy/internal/otel_ctx"
 	"github.com/mrksmt/deepseek-cursor-proxy/internal/store"
 	"github.com/mrksmt/deepseek-cursor-proxy/internal/streaming"
 )
@@ -384,7 +384,7 @@ func PrepareUpstreamRequest(
 	)
 
 	// Recovery loop — after recovery, convert back to raw for re-normalization
-	recoveryLoopCtx, recoveryLoopSpan := otel.Tracer("deepseek-cursor-proxy-go").Start(ctx, "transform.recoveryLoop")
+	recoveryLoopCtx, recoveryLoopSpan := otel_ctx.Tracer(ctx).Start(ctx, "transform.recoveryLoop")
 	recoveryIterations := 0
 	for len(missingIndexes) > 0 && cfg.MissingReasoningStrategy == "recover" {
 		recovered, dropped, notice, step := recoverMessagesFromMissingReasoning(messages, missingIndexes)
@@ -850,7 +850,7 @@ func normalizeMessages(
 	diagnostics []models.ReasoningDiagnostic,
 ) {
 
-	ctx, span := otel.Tracer("deepseek-cursor-proxy-go").Start(ctx, "transform.normalizeMessages")
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "transform.normalizeMessages")
 	defer span.End()
 
 	if len(rawMessages) == 0 {

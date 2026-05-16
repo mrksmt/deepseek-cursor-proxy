@@ -17,10 +17,9 @@ import (
 	"github.com/uptrace/bun/dialect/sqlitedialect"
 	"github.com/uptrace/bun/driver/sqliteshim"
 	"github.com/uptrace/bun/extra/bunotel"
-	otel_trace "go.opentelemetry.io/otel/trace"
 
 	"github.com/mrksmt/deepseek-cursor-proxy/internal/models"
-	"github.com/mrksmt/deepseek-cursor-proxy/internal/trace"
+	"github.com/mrksmt/deepseek-cursor-proxy/internal/otel_ctx"
 )
 
 // ReasoningStore provides a SQLite-backed cache for reasoning_content.
@@ -31,15 +30,10 @@ type ReasoningStore struct {
 	putCount      atomic.Int64
 	pruneInterval int64
 
-	tracer otel_trace.Tracer
-
-	mu       sync.RWMutex
+	mu       sync.Mutex
 	closed   bool
-	batchBuf map[threadKey][]batchItem
-}
-
-type threadKey struct {
-	threadID string
+	batchBuf []batchItem
+	batching bool
 }
 
 type batchItem struct {
@@ -55,8 +49,8 @@ func NewReasoningStore(
 	dbPath string,
 	maxAgeSeconds int,
 	maxRows int,
-	otelTracer *trace.OTelTracer,
 ) (*ReasoningStore, error) {
+
 	// Ensure parent directory exists
 	if dbPath != ":memory:" {
 		dir := filepath.Dir(dbPath)
@@ -108,8 +102,6 @@ func NewReasoningStore(
 		maxAge:        time.Duration(maxAgeSeconds) * time.Second,
 		maxRows:       maxRows,
 		pruneInterval: 100,
-		tracer:        otelTracer.Tracer(),
-		batchBuf:      make(map[threadKey][]batchItem),
 	}
 
 	// Initial pruning
@@ -123,7 +115,7 @@ func NewReasoningStore(
 
 // Close closes the database connection.
 func (s *ReasoningStore) Close(ctx context.Context) error {
-	ctx, span := s.tracer.Start(context.Background(), "store.Close")
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "store.Close")
 	defer span.End()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -135,22 +127,25 @@ func (s *ReasoningStore) Close(ctx context.Context) error {
 	return s.db.Close()
 }
 
-// BeginBatch starts buffering put() calls on the current goroutine.
+// BeginBatch starts buffering put() calls for the current streaming request.
+// Only one batch can be active at a time (SQLite is single-connection).
 func (s *ReasoningStore) BeginBatch() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := s.currentThreadKey()
-	s.batchBuf[key] = make([]batchItem, 0, 32)
+	s.batchBuf = make([]batchItem, 0, 32)
+	s.batching = true
 }
 
 // EndBatch flushes buffered puts and returns the number of rows written.
 func (s *ReasoningStore) EndBatch(ctx context.Context) (int, error) {
-	ctx, span := s.tracer.Start(ctx, "store.EndBatch")
+
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "store.EndBatch")
 	defer span.End()
+
 	s.mu.Lock()
-	key := s.currentThreadKey()
-	items := s.batchBuf[key]
-	delete(s.batchBuf, key)
+	items := s.batchBuf
+	s.batchBuf = nil
+	s.batching = false
 	s.mu.Unlock()
 
 	if len(items) == 0 {
@@ -190,8 +185,14 @@ func (s *ReasoningStore) EndBatch(ctx context.Context) (int, error) {
 }
 
 // Put stores a reasoning cache entry.
-func (s *ReasoningStore) Put(ctx context.Context, key, reasoning string, message map[string]any) error {
-	ctx, span := s.tracer.Start(ctx, "store.Put")
+func (s *ReasoningStore) Put(
+	ctx context.Context,
+	key,
+	reasoning string,
+	message map[string]any,
+) error {
+
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "store.Put")
 	defer span.End()
 	if reasoning == "" {
 		return nil
@@ -202,9 +203,8 @@ func (s *ReasoningStore) Put(ctx context.Context, key, reasoning string, message
 	}
 
 	s.mu.Lock()
-	tk := s.currentThreadKey()
-	if buf, ok := s.batchBuf[tk]; ok {
-		s.batchBuf[tk] = append(buf, batchItem{
+	if s.batching {
+		s.batchBuf = append(s.batchBuf, batchItem{
 			key:         key,
 			reasoning:   reasoning,
 			messageJSON: string(msgJSON),
@@ -223,7 +223,8 @@ func (s *ReasoningStore) Get(
 	ctx context.Context,
 	key string,
 ) (string, error) {
-	ctx, span := s.tracer.Start(ctx, "store.Get")
+
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "store.Get")
 	defer span.End()
 	entry := new(models.ReasoningCacheEntry)
 	err := s.db.NewSelect().
@@ -247,7 +248,8 @@ func (s *ReasoningStore) StoreAssistantMessage(
 	scope, cacheNamespace string,
 	priorMessages []models.Message,
 ) (int, error) {
-	ctx, span := s.tracer.Start(ctx, "store.StoreAssistantMessage")
+
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "store.StoreAssistantMessage")
 	defer span.End()
 	if message["role"] != "assistant" {
 		return 0, nil
@@ -287,7 +289,8 @@ func (s *ReasoningStore) LookupForMessage(
 	scope, cacheNamespace string,
 	priorMessages []models.Message,
 ) (string, error) {
-	ctx, span := s.tracer.Start(ctx, "store.LookupForMessage")
+
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "store.LookupForMessage")
 	defer span.End()
 	keys := scopedReasoningKeys(message, scope)
 	if cacheNamespace != "" && len(priorMessages) > 0 {
@@ -313,7 +316,8 @@ func (s *ReasoningStore) BackfillPortableAliases(
 	reasoning, cacheNamespace string,
 	priorMessages []models.Message,
 ) (int, error) {
-	ctx, span := s.tracer.Start(ctx, "store.BackfillPortableAliases")
+
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "store.BackfillPortableAliases")
 	defer span.End()
 	if reasoning == "" {
 		return 0, nil
@@ -346,7 +350,8 @@ func (s *ReasoningStore) BackfillPortableAliases(
 
 // Clear removes all entries from the cache and returns the count.
 func (s *ReasoningStore) Clear(ctx context.Context) (int, error) {
-	ctx, span := s.tracer.Start(ctx, "store.Clear")
+
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "store.Clear")
 	defer span.End()
 	var count int
 	err := s.db.NewSelect().
@@ -369,7 +374,8 @@ func (s *ReasoningStore) Clear(ctx context.Context) (int, error) {
 
 // Prune removes expired entries and enforces row limits.
 func (s *ReasoningStore) Prune(ctx context.Context) error {
-	ctx, span := s.tracer.Start(ctx, "store.Prune")
+
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "store.Prune")
 	defer span.End()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -377,7 +383,8 @@ func (s *ReasoningStore) Prune(ctx context.Context) error {
 }
 
 func (s *ReasoningStore) pruneLocked(ctx context.Context) error {
-	ctx, span := s.tracer.Start(ctx, "store.pruneLocked")
+
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "store.pruneLocked")
 	defer span.End()
 
 	// Age-based pruning
@@ -415,7 +422,8 @@ func (s *ReasoningStore) putDirect(
 	key, reasoning,
 	messageJSON string,
 ) error {
-	ctx, span := s.tracer.Start(ctx, "store.putDirect")
+	
+	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "store.putDirect")
 	defer span.End()
 
 	_, err := s.db.NewInsert().
@@ -438,43 +446,9 @@ func (s *ReasoningStore) putDirect(
 	return nil
 }
 
-func (s *ReasoningStore) currentThreadKey() threadKey {
-	return threadKey{threadID: fmt.Sprintf("%d", goroutineID())}
-}
-
-// goroutineID returns a semi-unique goroutine identifier.
-// This is a simple implementation; in practice, thread-local storage
-// in Go requires reflection, but for the batch buffer pattern we
-// approximate with unique IDs per call.
-var gidCounter atomic.Int64
-
-func goroutineID() int64 {
-	return gidCounter.Add(1)
-}
-
-// ---------------------------------------------------------------------------
-// Key derivation helpers (port of reasoning_store.py)
-// ---------------------------------------------------------------------------
-
 func sha256Hex(data string) string {
 	h := sha256.Sum256([]byte(data))
 	return fmt.Sprintf("%x", h)
-}
-
-func canonicalJSON(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return ""
-	}
-	return string(b)
-}
-
-func sortedJSON(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return ""
-	}
-	return string(b)
 }
 
 func normalizeToolCall(tc map[string]any) map[string]any {
@@ -557,60 +531,6 @@ func messageSignature(msg map[string]any) string {
 	}
 	canonical, _ := json.Marshal(payload)
 	return sha256Hex(string(canonical))
-}
-
-func conversationScope(messages []models.Message, namespace string) string {
-	scopeMsgs := make([]map[string]any, 0, len(messages))
-	for _, msg := range messages {
-		cm := map[string]any{
-			"role": msg.Role,
-		}
-		if msg.Content != "" {
-			cm["content"] = msg.Content
-		}
-		if msg.Name != "" {
-			cm["name"] = msg.Name
-		}
-		if msg.ToolCallID != "" {
-			cm["tool_call_id"] = msg.ToolCallID
-		}
-		if msg.Prefix != "" {
-			cm["prefix"] = msg.Prefix
-		}
-		if len(msg.ToolCalls) > 0 {
-			tcs := make([]map[string]any, 0, len(msg.ToolCalls))
-			for _, tc := range msg.ToolCalls {
-				tcs = append(tcs, map[string]any{
-					"id":   tc.ID,
-					"type": tc.Type,
-					"function": map[string]any{
-						"name":      tc.Function.Name,
-						"arguments": tc.Function.Arguments,
-					},
-				})
-			}
-			cm["tool_calls"] = tcs
-		}
-		scopeMsgs = append(scopeMsgs, cm)
-	}
-
-	var payload any = scopeMsgs
-	if namespace != "" {
-		payload = map[string]any{
-			"namespace": namespace,
-			"messages":  scopeMsgs,
-		}
-	}
-	canonical, _ := json.Marshal(payload)
-	return sha256Hex(string(canonical))
-}
-
-// ConversationScope computes a hash-based scope for a conversation.
-func (s *ReasoningStore) ConversationScope(messages []models.Message, namespace string) string {
-	ctx, span := s.tracer.Start(context.Background(), "store.ConversationScope")
-	defer span.End()
-	_ = ctx
-	return conversationScope(messages, namespace)
 }
 
 func scopedReasoningKeys(msg map[string]any, scope string) []string {

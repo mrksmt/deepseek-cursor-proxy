@@ -3,6 +3,7 @@ module github.com/mrksmt/deepseek-cursor-proxy
 go 1.26
 
 require (
+	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/labstack/echo-opentelemetry v0.0.2
 	github.com/labstack/echo/v5 v5.1.1
 	github.com/spf13/cobra v1.10.2
@@ -19,7 +20,6 @@ require (
 )
 
 require (
-	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fsnotify/fsnotify v1.10.1 // indirect

@@ -74,25 +74,24 @@ func main() {
 		}
 
 		// Initialize reasoning store
-		rs, err := store.NewReasoningStore(
+		reasoningStore, err := store.NewReasoningStore(
 			ctx,
 			cfg.ReasoningContentPath,
 			cfg.ReasoningCacheMaxAgeSeconds,
 			cfg.ReasoningCacheMaxRows,
-			otelTracer,
 		)
 		if err != nil {
 			return fmt.Errorf("cannot initialize reasoning store: %w", err)
 		}
 		defer func() {
-			if err := rs.Close(ctx); err != nil {
+			if err := reasoningStore.Close(ctx); err != nil {
 				log.Printf("error closing reasoning store: %v", err)
 			}
 		}()
 
 		// Handle clear cache
 		if cfg.ClearReasoningCache {
-			deleted, err := rs.Clear(ctx)
+			deleted, err := reasoningStore.Clear(ctx)
 			if err != nil {
 				return fmt.Errorf("cannot clear reasoning cache: %w", err)
 			}
@@ -100,21 +99,8 @@ func main() {
 			return nil
 		}
 
-		// Initialize trace writer
-		var tw *trace.TraceWriter
-		if cfg.TraceDir != "" {
-			tw, err = trace.NewTraceWriter(cfg.TraceDir)
-			if err != nil {
-				return fmt.Errorf("cannot initialize trace writer: %w", err)
-			}
-			if tw != nil {
-				log.Printf("trace_dir: %s", tw.SessionDir())
-				log.Printf("WARNING: trace logging enabled; prompts and code will be written to disk")
-			}
-		}
-
 		// Create proxy server
-		srv := server.NewProxyServer(cfg, rs, tw, otelTracer)
+		srv := server.NewProxyServer(cfg, reasoningStore)
 
 		// Start ngrok tunnel if enabled
 		var publicURL string

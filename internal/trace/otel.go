@@ -14,8 +14,6 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
-	"go.opentelemetry.io/otel/trace"
-	"go.opentelemetry.io/otel/trace/noop"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -32,10 +30,9 @@ type OTelConfig struct {
 	ServiceName string
 }
 
-// OTelTracer wraps the OTel tracer provider and tracer.
+// OTelTracer wraps the OTel tracer provider.
 type OTelTracer struct {
 	provider *sdktrace.TracerProvider
-	tracer   trace.Tracer
 }
 
 // InitOTel initializes the OTel tracer provider with an OTLP gRPC exporter.
@@ -106,14 +103,9 @@ func InitOTel(ctx context.Context, cfg OTelConfig) (*OTelTracer, error) {
 	// Set global tracer provider
 	otel.SetTracerProvider(tp)
 
-	tracer := tp.Tracer(serviceName)
-
 	log.Printf("otel: initialized tracer provider, exporting to %s (service=%s)", endpoint, serviceName)
 
-	return &OTelTracer{
-		provider: tp,
-		tracer:   tracer,
-	}, nil
+	return &OTelTracer{provider: tp}, nil
 }
 
 // Shutdown gracefully shuts down the tracer provider, flushing any remaining spans.
@@ -128,14 +120,6 @@ func (o *OTelTracer) Shutdown(ctx context.Context) error {
 	}
 	log.Printf("otel: tracer provider shut down")
 	return nil
-}
-
-// Tracer returns the underlying tracer.
-func (o *OTelTracer) Tracer() trace.Tracer {
-	if o == nil || o.tracer == nil {
-		return noop.NewTracerProvider().Tracer("noop")
-	}
-	return o.tracer
 }
 
 // Provider returns the underlying tracer provider.
