@@ -4,7 +4,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: deepseek-cursor-proxy
+    container_name: deepseek-cursor-proxy-ngrok-go
     restart: unless-stopped
     ports:
       - "${DEEPSEEK_HOST_PORT:-9000}:9000"
