@@ -1,0 +1,44 @@
+# AIs
+.claude/
+
+# Go build artifacts
+*.so
+*.exe
+*.test
+*.out
+
+
+# Distribution / packaging
+build/
+dist/
+
+# Environments
+.env
+.envrc
+.venv/
+env/
+venv/
+
+# Local config and caches
+.deepseek-cursor-proxy/
+.deepseek-cursor-reasoning.sqlite3*
+reasoning_content.sqlite3*
+trace-dumps/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Pre-commit / linters
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Assets (not needed at runtime)
+assets/

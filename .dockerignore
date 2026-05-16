@@ -1,0 +1,33 @@
+# Version control
+.git/
+.gitignore
+
+# CI
+.github/
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# Environments
+.venv/
+env/
+venv/
+
+# Local config and caches
+trace-dumps/
+reasoning_content.sqlite3*
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Assets (not needed at runtime)
+assets/

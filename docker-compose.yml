@@ -1,0 +1,39 @@
+services:
+  # ── Go variant (with ngrok) ──────────────────────────────────────────────
+  deepseek-cursor-proxy-ngrok-go:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: deepseek-cursor-proxy
+    restart: unless-stopped
+    ports:
+      - "${DEEPSEEK_HOST_PORT:-9000}:9000"
+      - "4040:4040"
+    volumes:
+      - deepseek-proxy-data:/data
+    environment:
+      - DEEPSEEK_HOST=0.0.0.0
+      - DEEPSEEK_PORT=9000
+
+      # ── Uncomment to override defaults ──────────────────────────────
+      # - DEEPSEEK_MODEL=deepseek-v4-pro
+      # - DEEPSEEK_BASE_URL=https://api.deepseek.com
+      # - DEEPSEEK_THINKING=enabled
+      # - DEEPSEEK_REASONING_EFFORT=max
+      - DEEPSEEK_REASONING_EFFORT=medium
+      # - DEEPSEEK_DISPLAY_REASONING=true
+      # - DEEPSEEK_COLLAPSIBLE_REASONING=true
+      # - DEEPSEEK_MISSING_REASONING_STRATEGY=recover
+      # - DEEPSEEK_VERBOSE=true
+      # - DEEPSEEK_CORS=true
+      - DEEPSEEK_REQUEST_TIMEOUT=120
+      # - DEEPSEEK_MAX_REQUEST_BODY_BYTES=20971520
+      - DEEPSEEK_NGROK=${DEEPSEEK_NGROK:-true}
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+      # OpenTelemetry tracing via OTLP gRPC
+      - DEEPSEEK_OTEL_ENDPOINT=${DEEPSEEK_OTEL_ENDPOINT:-host.docker.internal:4317}
+      - DEEPSEEK_OTEL_SERVICE_NAME=${DEEPSEEK_OTEL_SERVICE_NAME:-deepseek-cursor-proxy-go}
+
+volumes:
+  deepseek-proxy-data:
+    driver: local
