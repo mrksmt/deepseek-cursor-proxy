@@ -681,6 +681,7 @@ func normalizeMessage(
 	cacheNamespace string,
 	repairReasoning bool,
 	keepReasoning bool,
+	priorMessages []models.Message,
 ) (
 	normalized models.Message,
 	patched bool,
@@ -757,20 +758,20 @@ func normalizeMessage(
 			if normalized.ReasoningContent == "" || !keepReasoning {
 				normalized.ReasoningContent = ""
 				// Check if reasoning is needed (tool context)
-				needsReasoning := assistantNeedsReasoningForToolContext(normalized, nil)
+				needsReasoning := assistantNeedsReasoningForToolContext(normalized, priorMessages)
 
 				if needsReasoning && rs != nil {
 					// Build lookup keys and search
-					scope := conversationScopeFromMessages(nil, cacheNamespace)
+					scope := conversationScopeFromMessages(priorMessages, cacheNamespace)
 					// Try to find cached reasoning
 					msgMap := messageToMap(normalized)
 					incStoreLookups(ctx)
-					if cached, err := rs.LookupForMessage(ctx, msgMap, scope, cacheNamespace, nil); err == nil && cached != "" {
+					if cached, err := rs.LookupForMessage(ctx, msgMap, scope, cacheNamespace, priorMessages); err == nil && cached != "" {
 						normalized.ReasoningContent = cached
 						patched = true
 						// Backfill portable (namespace-scoped) keys so this cache hit
 						// is also available in other conversations with the same context.
-						rs.BackfillPortableAliases(ctx, msgMap, cached, cacheNamespace, nil)
+						rs.BackfillPortableAliases(ctx, msgMap, cached, cacheNamespace, priorMessages)
 					}
 				}
 
@@ -857,13 +858,20 @@ func normalizeMessages(
 		return
 	}
 
-	for _, raw := range rawMessages {
+	for i, raw := range rawMessages {
+		// Build prior messages slice for this message's index
+		var prior []models.Message
+		if i > 0 {
+			prior = messages[:i]
+		}
+
 		normalized, patched, missing, diag := normalizeMessage(
 			ctx,
 			raw, rs,
 			cacheNamespace,
 			repairReasoning,
 			keepReasoning,
+			prior,
 		)
 		messages = append(messages, normalized)
 		if patched {

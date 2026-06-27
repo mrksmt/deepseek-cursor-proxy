@@ -69,6 +69,7 @@ docker compose up --build -d
 
 # 4. Проверить
 curl http://127.0.0.1:9000/healthz
+curl https://f7pdmcx6-9000.euw.devtunnels.ms/health
 # → {"ok":true}
 ```
 
@@ -135,6 +136,21 @@ CGO_ENABLED=0 go build -o deepseek-cursor-proxy ./cmd/deepseek-cursor-proxy
 go build ./...
 go vet ./...
 ```
+
+## Планируется
+
+### Управление большим контекстом (context window management)
+
+При длительной работе агента Cursor (множество исправлений, десятки раундов tool-call'ов) история сообщений разрастается, что может приводить к неидеальному взаимодействию с DeepSeek V4.
+
+Возможные решения (не реализованы):
+
+- **Proactive truncation** — automatic обрезка истории сообщений при превышении лимита (количество сообщений или оценочный размер в токенах). DeepSeek V4 имеет context window ~64K–128K токенов.
+- **Context sliding window** — держать только последние N раундов диалога (user + assistant), старые дропать.
+- **Message count limit** — конфигурационный параметр `max_messages` (например, 100), при превышении которого прокси запускает recovery-цикл без ожидания ошибки от DeepSeek API.
+- **Aggressive cache pruning** — более интеллектуальная чистка reasoning cache для длинных сессий (старые записи вряд ли пригодятся для поиска).
+
+Pull requests приветствуются.
 
 ---
 

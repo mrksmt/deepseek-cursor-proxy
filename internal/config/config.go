@@ -11,53 +11,53 @@ import (
 )
 
 const (
-	AppDirName                   = ".deepseek-cursor-proxy"
-	ConfigFileName               = "config.yaml"
-	ReasoningContentFileName     = "reasoning_content.sqlite3"
+	AppDirName               = ".deepseek-cursor-proxy"
+	ConfigFileName           = "config.yaml"
+	ReasoningContentFileName = "reasoning_content.sqlite3"
 
-	defaultHost                   = "127.0.0.1"
-	defaultPort                   = 9000
-	defaultUpstreamBaseURL       = "https://api.deepseek.com"
-	defaultUpstreamModel         = "deepseek-v4-pro"
-	defaultThinking              = "enabled"
-	defaultReasoningEffort       = "max"
-	defaultDisplayReasoning      = true
-	defaultCollapsibleReasoning  = true
-	defaultNgrok                 = true
-	defaultVerbose               = false
-	defaultRequestTimeout        = 300.0
-	defaultMaxRequestBodyBytes   = 20 * 1024 * 1024
-	defaultCORS                  = false
+	defaultHost                     = "127.0.0.1"
+	defaultPort                     = 9000
+	defaultUpstreamBaseURL          = "https://api.deepseek.com"
+	defaultUpstreamModel            = "deepseek-v4-pro"
+	defaultThinking                 = "enabled"
+	defaultReasoningEffort          = "max"
+	defaultDisplayReasoning         = true
+	defaultCollapsibleReasoning     = true
+	defaultNgrok                    = true
+	defaultVerbose                  = false
+	defaultRequestTimeout           = 300.0
+	defaultMaxRequestBodyBytes      = 20 * 1024 * 1024
+	defaultCORS                     = false
 	defaultMissingReasoningStrategy = "recover"
-	defaultReasoningCacheMaxAge  = 30 * 24 * 60 * 60
-	defaultReasoningCacheMaxRows = 100000
-	defaultMaxConcurrentRequests = 10
+	defaultReasoningCacheMaxAge     = 30 * 24 * 60 * 60
+	defaultReasoningCacheMaxRows    = 100000
+	defaultMaxConcurrentRequests    = 10
 )
 
 // Config holds all configuration for the proxy.
 type Config struct {
-	Host                       string `mapstructure:"host"`
-	Port                       int    `mapstructure:"port"`
-	UpstreamBaseURL            string `mapstructure:"base_url"`
-	UpstreamModel              string `mapstructure:"model"`
-	Thinking                   string `mapstructure:"thinking"`
-	ReasoningEffort            string `mapstructure:"reasoning_effort"`
-	RequestTimeout             float64 `mapstructure:"request_timeout"`
-	MaxRequestBodyBytes        int64  `mapstructure:"max_request_body_bytes"`
-	ReasoningContentPath       string `mapstructure:"reasoning_content_path"`
-	MissingReasoningStrategy   string `mapstructure:"missing_reasoning_strategy"`
-	ReasoningCacheMaxAgeSeconds int   `mapstructure:"reasoning_cache_max_age_seconds"`
-	ReasoningCacheMaxRows      int    `mapstructure:"reasoning_cache_max_rows"`
-	DisplayReasoning           bool   `mapstructure:"display_reasoning"`
-	CollapsibleReasoning       bool   `mapstructure:"collapsible_reasoning"`
-	CORS                       bool   `mapstructure:"cors"`
-	Verbose                    bool   `mapstructure:"verbose"`
-	Ngrok                      bool   `mapstructure:"ngrok"`
-	NgrokURL                   string `mapstructure:"ngrok_url"`
-	MaxConcurrentRequests      int    `mapstructure:"max_concurrent_requests"`
-	OTelEndpoint               string `mapstructure:"otel_endpoint"`
-	OTelServiceName            string `mapstructure:"otel_service_name"`
-	ClearReasoningCache        bool   `mapstructure:"-"`
+	Host                        string  `mapstructure:"host"`
+	Port                        int     `mapstructure:"port"`
+	UpstreamBaseURL             string  `mapstructure:"base_url"`
+	UpstreamModel               string  `mapstructure:"model"`
+	Thinking                    string  `mapstructure:"thinking"`
+	ReasoningEffort             string  `mapstructure:"reasoning_effort"`
+	RequestTimeout              float64 `mapstructure:"request_timeout"`
+	MaxRequestBodyBytes         int64   `mapstructure:"max_request_body_bytes"`
+	ReasoningContentPath        string  `mapstructure:"reasoning_content_path"`
+	MissingReasoningStrategy    string  `mapstructure:"missing_reasoning_strategy"`
+	ReasoningCacheMaxAgeSeconds int     `mapstructure:"reasoning_cache_max_age_seconds"`
+	ReasoningCacheMaxRows       int     `mapstructure:"reasoning_cache_max_rows"`
+	DisplayReasoning            bool    `mapstructure:"display_reasoning"`
+	CollapsibleReasoning        bool    `mapstructure:"collapsible_reasoning"`
+	CORS                        bool    `mapstructure:"cors"`
+	Verbose                     bool    `mapstructure:"verbose"`
+	Ngrok                       bool    `mapstructure:"ngrok"`
+	NgrokURL                    string  `mapstructure:"ngrok_url"`
+	MaxConcurrentRequests       int     `mapstructure:"max_concurrent_requests"`
+	OTelEndpoint                string  `mapstructure:"otel_endpoint"`
+	OTelServiceName             string  `mapstructure:"otel_service_name"`
+	ClearReasoningCache         bool    `mapstructure:"-"`
 }
 
 // defaultAppDir returns ~/.deepseek-cursor-proxy.
@@ -90,23 +90,23 @@ func defaultReasoningContentPath() (string, error) {
 // NewDefaultConfig creates a Config with all defaults applied.
 func NewDefaultConfig() *Config {
 	return &Config{
-		Host:                       defaultHost,
-		Port:                       defaultPort,
-		UpstreamBaseURL:            defaultUpstreamBaseURL,
-		UpstreamModel:              defaultUpstreamModel,
-		Thinking:                   defaultThinking,
-		ReasoningEffort:            defaultReasoningEffort,
-		RequestTimeout:             defaultRequestTimeout,
-		MaxRequestBodyBytes:        defaultMaxRequestBodyBytes,
-		MissingReasoningStrategy:   defaultMissingReasoningStrategy,
+		Host:                        defaultHost,
+		Port:                        defaultPort,
+		UpstreamBaseURL:             defaultUpstreamBaseURL,
+		UpstreamModel:               defaultUpstreamModel,
+		Thinking:                    defaultThinking,
+		ReasoningEffort:             defaultReasoningEffort,
+		RequestTimeout:              defaultRequestTimeout,
+		MaxRequestBodyBytes:         defaultMaxRequestBodyBytes,
+		MissingReasoningStrategy:    defaultMissingReasoningStrategy,
 		ReasoningCacheMaxAgeSeconds: defaultReasoningCacheMaxAge,
-		ReasoningCacheMaxRows:      defaultReasoningCacheMaxRows,
-		DisplayReasoning:           defaultDisplayReasoning,
-		CollapsibleReasoning:       defaultCollapsibleReasoning,
-		CORS:                       defaultCORS,
-		Verbose:                    defaultVerbose,
-		Ngrok:                      defaultNgrok,
-		MaxConcurrentRequests:      defaultMaxConcurrentRequests,
+		ReasoningCacheMaxRows:       defaultReasoningCacheMaxRows,
+		DisplayReasoning:            defaultDisplayReasoning,
+		CollapsibleReasoning:        defaultCollapsibleReasoning,
+		CORS:                        defaultCORS,
+		Verbose:                     defaultVerbose,
+		Ngrok:                       defaultNgrok,
+		MaxConcurrentRequests:       defaultMaxConcurrentRequests,
 	}
 }
 
@@ -115,7 +115,7 @@ func defaultConfigYAML() string {
 	return fmt.Sprintf(`# This file was created automatically at ~/.deepseek-cursor-proxy/config.yaml.
 # API keys are read from Cursor's Authorization header and forwarded upstream.
 
-# ` + "`model`" + ` is the fallback when a request has no model; Cursor's requested
+# `+"`model`"+` is the fallback when a request has no model; Cursor's requested
 # DeepSeek model name is otherwise respected.
 base_url: %s
 model: %s
@@ -233,7 +233,6 @@ solving compatibility issues with DeepSeek's thinking-mode tool-call API.`,
 	rootCmd.Flags().String("otel-service-name", "deepseek-cursor-proxy-go", "OpenTelemetry service name")
 	// Note: OTel flags are NOT bound to Viper to avoid pflag defaults overriding env vars.
 	// They are read directly from os.Getenv in LoadConfig.
-	rootCmd.Flags().Int("max-concurrent-requests", defaultMaxConcurrentRequests, "Maximum concurrent requests")
 	rootCmd.Flags().Bool("clear-reasoning-cache", false, "Clear the reasoning cache and exit")
 
 	// Bind pflags to viper
