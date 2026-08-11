@@ -78,11 +78,9 @@ var allMessageFields = map[string]bool{
 
 // Effort aliases map various effort levels to normalized values.
 var effortAliases = map[string]string{
-	"low":    "high",
-	"medium": "high",
-	"high":   "high",
-	"max":    "max",
-	"xhigh":  "max",
+	"low":  "low",
+	"high": "high",
+	"max":  "max",
 }
 
 // Recovery notice text constants.
@@ -103,6 +101,25 @@ func NormalizeReasoningEffort(value string) string {
 		return alias
 	}
 	return "high"
+}
+
+// ParseEffortFromModel extracts a reasoning effort encoded as a model name
+// suffix (e.g. "deepseek-v4-pro:max"). When the suffix is a known effort level
+// it is stripped from the returned model name; otherwise the model is returned
+// unchanged with an empty effort.
+func ParseEffortFromModel(model string) (string, string) {
+	if idx := strings.LastIndex(model, ":"); idx > 0 {
+		effort := model[idx+1:]
+		if isKnownEffort(effort) {
+			return model[:idx], effort
+		}
+	}
+	return model, ""
+}
+
+func isKnownEffort(value string) bool {
+	_, ok := effortAliases[strings.TrimSpace(strings.ToLower(value))]
+	return ok
 }
 
 // ExtractTextContent extracts plain text from a content field.
@@ -263,10 +280,14 @@ func PrepareUpstreamRequest(
 	// Initialize store lookups counter in context
 	ctx = withStoreLookupsCounter(ctx)
 
-	originalModel, _ := payload["model"].(string)
-	if originalModel == "" {
-		originalModel = cfg.UpstreamModel
+	clientModel, _ := payload["model"].(string)
+	if clientModel == "" {
+		clientModel = cfg.UpstreamModel
 	}
+
+	// A reasoning effort may be encoded in the model name suffix
+	// (e.g. "deepseek-v4-pro:max"); it overrides the configured effort.
+	originalModel, modelEffort := ParseEffortFromModel(clientModel)
 
 	upstreamModel := upstreamModelFor(originalModel, cfg)
 
@@ -335,8 +356,15 @@ func PrepareUpstreamRequest(
 	}
 	thinkingEnabled := cfg.Thinking == "enabled"
 	thinkingDisabled := cfg.Thinking == "disabled"
+	effort := cfg.ReasoningEffort
+	if modelEffort != "" {
+		effort = modelEffort
+	}
+	upstreamEffort := ""
+	requestedEffort := modelEffort
 	if thinkingEnabled {
-		prepared["reasoning_effort"] = NormalizeReasoningEffort(cfg.ReasoningEffort)
+		upstreamEffort = NormalizeReasoningEffort(effort)
+		prepared["reasoning_effort"] = upstreamEffort
 	}
 
 	// Compute cache namespace
@@ -344,7 +372,7 @@ func PrepareUpstreamRequest(
 		cfg.UpstreamBaseURL,
 		upstreamModel,
 		cfg.Thinking,
-		cfg.ReasoningEffort,
+		effort,
 		authorization,
 	)
 
@@ -430,8 +458,10 @@ func PrepareUpstreamRequest(
 
 	return &models.PreparedRequest{
 		Payload:                    prepared,
-		OriginalModel:              originalModel,
+		OriginalModel:              clientModel,
 		UpstreamModel:              upstreamModel,
+		UpstreamEffort:             upstreamEffort,
+		RequestedEffort:            requestedEffort,
 		CacheNamespace:             cacheNamespace,
 		PatchedReasoningMessages:   patchedCount,
 		MissingReasoningMessages:   len(missingIndexes),

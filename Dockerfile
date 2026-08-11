@@ -17,12 +17,12 @@ RUN set -eux; \
     apk add --no-cache ca-certificates; \
     arch="$(apk --print-arch)"; \
     case "$arch" in \
-        x86_64)  ngrok_arch="amd64" ;; \
-        aarch64) ngrok_arch="arm64" ;; \
-        *) echo "Unsupported architecture: $arch"; exit 1 ;; \
+    x86_64)  ngrok_arch="amd64" ;; \
+    aarch64) ngrok_arch="arm64" ;; \
+    *) echo "Unsupported architecture: $arch"; exit 1 ;; \
     esac; \
     wget -qO- "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-${ngrok_arch}.tgz" \
-        | tar xz -C /usr/local/bin; \
+    | tar xz -C /usr/local/bin; \
     ngrok version
 
 # Copy the Go binary

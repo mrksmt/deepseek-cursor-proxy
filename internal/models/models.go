@@ -182,6 +182,8 @@ type PreparedRequest struct {
 	Payload                    map[string]any
 	OriginalModel              string
 	UpstreamModel              string
+	UpstreamEffort             string
+	RequestedEffort            string
 	CacheNamespace             string
 	PatchedReasoningMessages   int
 	MissingReasoningMessages   int
@@ -232,6 +234,15 @@ type ReasoningCacheEntry struct {
 	Reasoning   string    `bun:",notnull"`
 	MessageJSON string    `bun:",notnull"`
 	CreatedAt   time.Time `bun:",notnull"`
+}
+
+// ReasoningEffortLevels are the effort levels selectable via a model name
+// suffix (e.g. "deepseek-v4-pro:max"). The colon form is used so the base
+// model name stays intact for upstream routing.
+var ReasoningEffortLevels = []string{
+	"low",
+	"high",
+	"max",
 }
 
 // ModelsList are the model IDs to announce.

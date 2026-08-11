@@ -217,7 +217,7 @@ solving compatibility issues with DeepSeek's thinking-mode tool-call API.`,
 	rootCmd.Flags().String("base-url", defaultUpstreamBaseURL, "DeepSeek base URL")
 	rootCmd.Flags().String("model", defaultUpstreamModel, "Fallback DeepSeek model")
 	rootCmd.Flags().String("thinking", defaultThinking, "Thinking mode: enabled or disabled")
-	rootCmd.Flags().String("reasoning-effort", defaultReasoningEffort, "Reasoning effort: low, medium, high, max, xhigh")
+	rootCmd.Flags().String("reasoning-effort", defaultReasoningEffort, "Reasoning effort: low, high, max")
 	rootCmd.Flags().Float64("request-timeout", defaultRequestTimeout, "Upstream request timeout in seconds")
 	rootCmd.Flags().Int64("max-request-body-bytes", defaultMaxRequestBodyBytes, "Maximum accepted request body size")
 	rootCmd.Flags().String("missing-reasoning-strategy", defaultMissingReasoningStrategy, "Strategy: recover or reject")

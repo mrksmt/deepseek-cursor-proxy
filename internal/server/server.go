@@ -154,11 +154,23 @@ func (s *ProxyServer) handleHealth(c *echo.Context) error {
 func (s *ProxyServer) handleModels(c *echo.Context) error {
 
 	created := time.Now().Unix()
-	modelIDs := make([]string, 0, len(models.ModelsList)+1)
-	modelIDs = append(modelIDs, s.cfg.UpstreamModel)
+
+	// Base model IDs (the configured fallback plus the announced list).
+	baseIDs := make([]string, 0, len(models.ModelsList)+1)
+	baseIDs = append(baseIDs, s.cfg.UpstreamModel)
 	for _, m := range models.ModelsList {
 		if m != s.cfg.UpstreamModel {
-			modelIDs = append(modelIDs, m)
+			baseIDs = append(baseIDs, m)
+		}
+	}
+
+	// Each base model is also announced with a reasoning effort suffix so the
+	// level can be picked from Cursor's model dropdown (e.g. deepseek-v4-pro:max).
+	modelIDs := make([]string, 0, len(baseIDs)*(1+len(models.ReasoningEffortLevels)))
+	for _, id := range baseIDs {
+		modelIDs = append(modelIDs, id)
+		for _, effort := range models.ReasoningEffortLevels {
+			modelIDs = append(modelIDs, fmt.Sprintf("%s:%s", id, effort))
 		}
 	}
 
@@ -215,7 +227,7 @@ func (s *ProxyServer) handleChatCompletions(c *echo.Context) (err error) {
 		attribute.Int("body_size", len(upstreamBody)),
 	))
 
-	upResp, err := s.doUpstream(ctx, upReq, prepared.UpstreamModel)
+	upResp, err := s.doUpstream(ctx, upReq, prepared.UpstreamModel, prepared.UpstreamEffort)
 	if err != nil {
 		return writeError(c, err)
 	}
@@ -236,6 +248,10 @@ func (s *ProxyServer) handleChatCompletions(c *echo.Context) (err error) {
 
 	span.SetAttributes(
 		attribute.String("upstream_model", prepared.UpstreamModel),
+		attribute.String("upstream_reasoning_effort", prepared.UpstreamEffort),
+		attribute.String("requested_reasoning_effort", prepared.RequestedEffort),
+		attribute.String("original_model", prepared.OriginalModel),
+		attribute.String("thinking", s.cfg.Thinking),
 	)
 	if result.usage != nil {
 		span.AddEvent("tokens.usage", otel_trace.WithAttributes(
@@ -444,6 +460,7 @@ func (s *ProxyServer) doUpstream(
 	ctx context.Context,
 	upReq *http.Request,
 	upstreamModel string,
+	upstreamEffort string,
 ) (*http.Response, error) {
 
 	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "doUpstream")
@@ -451,6 +468,7 @@ func (s *ProxyServer) doUpstream(
 
 	span.SetAttributes(
 		attribute.String("upstream.model", upstreamModel),
+		attribute.String("upstream.reasoning_effort", upstreamEffort),
 	)
 
 	upResp, err := s.upstreamRoundTrip(ctx, upReq)
