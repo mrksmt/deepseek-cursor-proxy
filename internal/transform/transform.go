@@ -103,18 +103,39 @@ func NormalizeReasoningEffort(value string) string {
 	return "high"
 }
 
-// ParseEffortFromModel extracts a reasoning effort encoded as a model name
-// suffix (e.g. "deepseek-v4-pro:max"). When the suffix is a known effort level
-// it is stripped from the returned model name; otherwise the model is returned
-// unchanged with an empty effort.
-func ParseEffortFromModel(model string) (string, string) {
-	if idx := strings.LastIndex(model, ":"); idx > 0 {
-		effort := model[idx+1:]
-		if isKnownEffort(effort) {
-			return model[:idx], effort
+// ParseModelSuffixes extracts a reasoning effort and a thinking toggle encoded
+// as model name suffixes, e.g. "deepseek-v4-pro:max" or "deepseek-v4-pro:low:nothink".
+// Known suffixes are stripped from the returned model name; the base model is
+// returned unchanged when a suffix is not recognized.
+func ParseModelSuffixes(model string) (base string, effort string, noThink bool) {
+	parts := strings.Split(model, ":")
+	base = parts[0]
+
+	// Only strip suffixes when every part after the base is recognized; an
+	// unknown suffix is left intact so the model is routed upstream as-is.
+	if len(parts) > 1 {
+		for _, p := range parts[1:] {
+			if !strings.EqualFold(p, "nothink") && !isKnownEffort(p) {
+				return model, "", false
+			}
+		}
+		for _, p := range parts[1:] {
+			switch {
+			case strings.EqualFold(p, "nothink"):
+				noThink = true
+			case isKnownEffort(p):
+				effort = p
+			}
 		}
 	}
-	return model, ""
+	return base, effort, noThink
+}
+
+// ParseEffortFromModel extracts only the reasoning effort suffix from a model
+// name (e.g. "deepseek-v4-pro:max"), stripping it from the returned name.
+func ParseEffortFromModel(model string) (string, string) {
+	base, effort, _ := ParseModelSuffixes(model)
+	return base, effort
 }
 
 func isKnownEffort(value string) bool {
@@ -285,9 +306,9 @@ func PrepareUpstreamRequest(
 		clientModel = cfg.UpstreamModel
 	}
 
-	// A reasoning effort may be encoded in the model name suffix
-	// (e.g. "deepseek-v4-pro:max"); it overrides the configured effort.
-	originalModel, modelEffort := ParseEffortFromModel(clientModel)
+	// A reasoning effort and thinking toggle may be encoded in the model name
+	// suffix (e.g. "deepseek-v4-pro:max" or "deepseek-v4-pro:low:nothink").
+	originalModel, modelEffort, modelNoThink := ParseModelSuffixes(clientModel)
 
 	upstreamModel := upstreamModelFor(originalModel, cfg)
 
@@ -350,12 +371,17 @@ func PrepareUpstreamRequest(
 		}
 	}
 
-	// Thinking config
-	prepared["thinking"] = map[string]any{
-		"type": cfg.Thinking,
+	// Thinking config. A :nothink suffix forces thinking disabled regardless
+	// of the configured default so simple tasks answer without reasoning.
+	thinking := cfg.Thinking
+	if modelNoThink {
+		thinking = "disabled"
 	}
-	thinkingEnabled := cfg.Thinking == "enabled"
-	thinkingDisabled := cfg.Thinking == "disabled"
+	prepared["thinking"] = map[string]any{
+		"type": thinking,
+	}
+	thinkingEnabled := thinking == "enabled"
+	thinkingDisabled := thinking == "disabled"
 	effort := cfg.ReasoningEffort
 	if modelEffort != "" {
 		effort = modelEffort
@@ -371,7 +397,7 @@ func PrepareUpstreamRequest(
 	cacheNamespace := store.ComputeReasoningCacheNamespace(
 		cfg.UpstreamBaseURL,
 		upstreamModel,
-		cfg.Thinking,
+		thinking,
 		effort,
 		authorization,
 	)
@@ -461,6 +487,7 @@ func PrepareUpstreamRequest(
 		OriginalModel:              clientModel,
 		UpstreamModel:              upstreamModel,
 		UpstreamEffort:             upstreamEffort,
+		UpstreamThinking:           thinking,
 		RequestedEffort:            requestedEffort,
 		CacheNamespace:             cacheNamespace,
 		PatchedReasoningMessages:   patchedCount,

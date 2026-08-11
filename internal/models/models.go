@@ -183,6 +183,7 @@ type PreparedRequest struct {
 	OriginalModel              string
 	UpstreamModel              string
 	UpstreamEffort             string
+	UpstreamThinking           string
 	RequestedEffort            string
 	CacheNamespace             string
 	PatchedReasoningMessages   int
