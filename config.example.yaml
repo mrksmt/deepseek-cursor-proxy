@@ -4,7 +4,7 @@
 # `model` is the fallback when a request has no model; Cursor's requested
 # DeepSeek model name is otherwise respected.
 base_url: https://api.deepseek.com
-model: deepseek-v4-pro
+model: deepseek-flash
 thinking: enabled
 reasoning_effort: max
 display_reasoning: true

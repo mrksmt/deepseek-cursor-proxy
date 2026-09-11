@@ -165,8 +165,8 @@ func (s *ProxyServer) handleModels(c *echo.Context) error {
 	}
 
 	// Each base model is also announced with a reasoning effort suffix and/or a
-	// :nothink toggle (e.g. deepseek-v4-pro:max, deepseek-v4-pro:nothink,
-	// deepseek-v4-flash:low:nothink) so both can be picked from Cursor's dropdown.
+	// :nothink toggle (e.g. deepseek-flash:max, deepseek-flash:nothink,
+	// deepseek-v4-pro:low:nothink) so all can be picked from Cursor's dropdown.
 	modelIDs := make([]string, 0, len(baseIDs)*(1+len(models.ReasoningEffortLevels))*2)
 	for _, id := range baseIDs {
 		modelIDs = append(modelIDs, id)

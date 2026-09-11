@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -422,7 +423,6 @@ func (s *ReasoningStore) putDirect(
 	key, reasoning,
 	messageJSON string,
 ) error {
-	
 	ctx, span := otel_ctx.Tracer(ctx).Start(ctx, "store.putDirect")
 	defer span.End()
 
@@ -621,7 +621,10 @@ func ComputeReasoningCacheNamespace(baseURL, model, thinking string, reasoningEf
 		authHash = sha256Hex(authorization)
 	}
 	modelFamily := model
-	if model == "deepseek-v4-pro" || model == "deepseek-v4-flash" {
+	// Fold every DeepSeek V4-era name (V4, V4.1) into a single family so the
+	// reasoning cache namespace survives renames like v4-pro -> deepseek-flash.
+	if strings.HasPrefix(model, "deepseek-v4") || model == "deepseek-flash" ||
+		strings.HasPrefix(model, "deepseek-flash-") {
 		modelFamily = "deepseek-v4"
 	}
 	payload := map[string]any{

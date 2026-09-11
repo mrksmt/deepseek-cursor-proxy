@@ -16,7 +16,7 @@ services:
       - DEEPSEEK_PORT=9000
 
       # ── Uncomment to override defaults ──────────────────────────────
-      # - DEEPSEEK_MODEL=deepseek-v4-pro
+      # - DEEPSEEK_MODEL=deepseek-flash
       # - DEEPSEEK_BASE_URL=https://api.deepseek.com
       # - DEEPSEEK_THINKING=enabled
       # - DEEPSEEK_REASONING_EFFORT=max
@@ -30,8 +30,10 @@ services:
       # - DEEPSEEK_MAX_REQUEST_BODY_BYTES=20971520
       - DEEPSEEK_NGROK=${DEEPSEEK_NGROK:-true}
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
-      # OpenTelemetry tracing via OTLP gRPC
-      - DEEPSEEK_OTEL_ENDPOINT=${DEEPSEEK_OTEL_ENDPOINT:-host.docker.internal:4317}
+      # OpenTelemetry tracing via OTLP gRPC.
+      # The local collector container owns host port 14317 (-> container 4317),
+      # so from inside this container the host address is host.docker.internal:14317.
+      - DEEPSEEK_OTEL_ENDPOINT=${DEEPSEEK_OTEL_ENDPOINT:-host.docker.internal:14317}
       - DEEPSEEK_OTEL_SERVICE_NAME=${DEEPSEEK_OTEL_SERVICE_NAME:-deepseek-cursor-proxy-go}
 
 volumes:

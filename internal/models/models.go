@@ -238,7 +238,7 @@ type ReasoningCacheEntry struct {
 }
 
 // ReasoningEffortLevels are the effort levels selectable via a model name
-// suffix (e.g. "deepseek-v4-pro:max"). The colon form is used so the base
+// suffix (e.g. "deepseek-flash:max"). The colon form is used so the base
 // model name stays intact for upstream routing.
 var ReasoningEffortLevels = []string{
 	"low",
@@ -247,7 +247,12 @@ var ReasoningEffortLevels = []string{
 }
 
 // ModelsList are the model IDs to announce.
+//
+// deepseek-flash is the current canonical name (V4.1-Flash). The legacy
+// deepseek-v4-* names are kept so existing Cursor configs continue to resolve
+// while DeepSeek still accepts them as compatibility aliases.
 var ModelsList = []string{
+	"deepseek-flash",
 	"deepseek-v4-pro",
 	"deepseek-v4-flash",
 }

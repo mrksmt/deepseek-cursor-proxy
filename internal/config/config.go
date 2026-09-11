@@ -18,7 +18,7 @@ const (
 	defaultHost                     = "127.0.0.1"
 	defaultPort                     = 9000
 	defaultUpstreamBaseURL          = "https://api.deepseek.com"
-	defaultUpstreamModel            = "deepseek-v4-pro"
+	defaultUpstreamModel            = "deepseek-flash"
 	defaultThinking                 = "enabled"
 	defaultReasoningEffort          = "max"
 	defaultDisplayReasoning         = true

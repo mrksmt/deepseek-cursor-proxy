@@ -114,7 +114,7 @@ docker run -d --name jaeger \
 |---|---|---|
 | `DEEPSEEK_HOST` | `127.0.0.1` | Адрес для привязки |
 | `DEEPSEEK_PORT` | `9000` | Порт |
-| `DEEPSEEK_MODEL` | `deepseek-v4-pro` | Модель по умолчанию |
+| `DEEPSEEK_MODEL` | `deepseek-flash` | Модель по умолчанию (V4.1-Flash) |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | Адрес DeepSeek API |
 | `DEEPSEEK_NGROK` | `true` | Включить ngrok-туннель |
 | `DEEPSEEK_REASONING_EFFORT` | `medium` | Уровень reasoning: low, medium, high, max |
@@ -141,11 +141,11 @@ go vet ./...
 
 ### Управление большим контекстом (context window management)
 
-При длительной работе агента Cursor (множество исправлений, десятки раундов tool-call'ов) история сообщений разрастается, что может приводить к неидеальному взаимодействию с DeepSeek V4.
+При длительной работе агента Cursor (множество исправлений, десятки раундов tool-call'ов) история сообщений разрастается, что может приводить к неидеальному взаимодействию с DeepSeek.
 
 Возможные решения (не реализованы):
 
-- **Proactive truncation** — automatic обрезка истории сообщений при превышении лимита (количество сообщений или оценочный размер в токенах). DeepSeek V4 имеет context window ~64K–128K токенов.
+- **Proactive truncation** — automatic обрезка истории сообщений при превышении лимита (количество сообщений или оценочный размер в токенах). DeepSeek-V4.1-Flash (`deepseek-flash`) имеет context window ~1M токенов; устаревшие алиасы `deepseek-v4-*` — ~64K–128K.
 - **Context sliding window** — держать только последние N раундов диалога (user + assistant), старые дропать.
 - **Message count limit** — конфигурационный параметр `max_messages` (например, 100), при превышении которого прокси запускает recovery-цикл без ожидания ошибки от DeepSeek API.
 - **Aggressive cache pruning** — более интеллектуальная чистка reasoning cache для длинных сессий (старые записи вряд ли пригодятся для поиска).

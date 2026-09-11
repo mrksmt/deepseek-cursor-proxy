@@ -104,7 +104,7 @@ func NormalizeReasoningEffort(value string) string {
 }
 
 // ParseModelSuffixes extracts a reasoning effort and a thinking toggle encoded
-// as model name suffixes, e.g. "deepseek-v4-pro:max" or "deepseek-v4-pro:low:nothink".
+// as model name suffixes, e.g. "deepseek-flash:max" or "deepseek-flash:low:nothink".
 // Known suffixes are stripped from the returned model name; the base model is
 // returned unchanged when a suffix is not recognized.
 func ParseModelSuffixes(model string) (base string, effort string, noThink bool) {
@@ -132,7 +132,7 @@ func ParseModelSuffixes(model string) (base string, effort string, noThink bool)
 }
 
 // ParseEffortFromModel extracts only the reasoning effort suffix from a model
-// name (e.g. "deepseek-v4-pro:max"), stripping it from the returned name.
+// name (e.g. "deepseek-flash:max"), stripping it from the returned name.
 func ParseEffortFromModel(model string) (string, string) {
 	base, effort, _ := ParseModelSuffixes(model)
 	return base, effort
@@ -307,7 +307,7 @@ func PrepareUpstreamRequest(
 	}
 
 	// A reasoning effort and thinking toggle may be encoded in the model name
-	// suffix (e.g. "deepseek-v4-pro:max" or "deepseek-v4-pro:low:nothink").
+	// suffix (e.g. "deepseek-flash:max" or "deepseek-flash:low:nothink").
 	originalModel, modelEffort, modelNoThink := ParseModelSuffixes(clientModel)
 
 	upstreamModel := upstreamModelFor(originalModel, cfg)
