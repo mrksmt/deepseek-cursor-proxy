@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -556,8 +557,8 @@ func scopedReasoningKeys(msg map[string]any, scope string) []string {
 
 func turnContextSignature(priorMsgs []models.Message) string {
 	lastUserIdx := -1
-	for i := len(priorMsgs) - 1; i >= 0; i-- {
-		if priorMsgs[i].Role == "user" {
+	for i, priorMsg := range slices.Backward(priorMsgs) {
+		if priorMsg.Role == "user" {
 			lastUserIdx = i
 			break
 		}

@@ -23,3 +23,16 @@ missing_reasoning_strategy: recover
 reasoning_cache_max_age_seconds: 2592000
 reasoning_cache_max_rows: 100000
 max_concurrent_requests: 10
+
+# History truncation. Zero disables the respective limit.
+# max_messages trims the oldest conversation rounds once the message count
+# exceeds it (system messages and the latest user turn are always kept).
+# It is a soft cap: history is cut on round boundaries, so the kept count
+# may land below the cap rather than exactly on it. Default: 200.
+# It can be overridden per request via a named model name suffix, e.g.
+# "deepseek-flash:low:nothink:mm200" or "deepseek-flash:mm300". Suffix order
+# does not matter.
+# max_prompt_tokens is a coarse secondary guard on estimated prompt size.
+# Default: 0 (disabled).
+max_messages: 200
+max_prompt_tokens: 0

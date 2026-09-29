@@ -164,10 +164,11 @@ func (s *ProxyServer) handleModels(c *echo.Context) error {
 		}
 	}
 
-	// Each base model is also announced with a reasoning effort suffix and/or a
-	// :nothink toggle (e.g. deepseek-flash:max, deepseek-flash:nothink,
-	// deepseek-v4-pro:low:nothink) so all can be picked from Cursor's dropdown.
-	modelIDs := make([]string, 0, len(baseIDs)*(1+len(models.ReasoningEffortLevels))*2)
+	// Each base model is also announced with a reasoning effort suffix, a
+	// :nothink toggle and/or a numeric history cap (e.g. deepseek-flash:max,
+	// deepseek-flash:nothink, deepseek-flash:low:nothink:120) so all can be
+	// picked from Cursor's dropdown without editing config.
+	modelIDs := make([]string, 0, len(baseIDs)*(1+len(models.ReasoningEffortLevels))*2*3)
 	for _, id := range baseIDs {
 		modelIDs = append(modelIDs, id)
 		for _, effort := range models.ReasoningEffortLevels {
@@ -176,6 +177,12 @@ func (s *ProxyServer) handleModels(c *echo.Context) error {
 		modelIDs = append(modelIDs, fmt.Sprintf("%s:nothink", id))
 		for _, effort := range models.ReasoningEffortLevels {
 			modelIDs = append(modelIDs, fmt.Sprintf("%s:%s:nothink", id, effort))
+		}
+		for _, maxMessages := range models.MaxMessagesLevels {
+			modelIDs = append(modelIDs, fmt.Sprintf("%s:mm%d", id, maxMessages))
+			modelIDs = append(modelIDs, fmt.Sprintf("%s:low:mm%d", id, maxMessages))
+			modelIDs = append(modelIDs, fmt.Sprintf("%s:mm%d:nothink", id, maxMessages))
+			modelIDs = append(modelIDs, fmt.Sprintf("%s:low:mm%d:nothink", id, maxMessages))
 		}
 	}
 
@@ -376,12 +383,16 @@ func (s *ProxyServer) prepareUpstream(
 	prepared := transform.PrepareUpstreamRequest(ctx, payload, s.cfg, s.reasoningStore, token)
 
 	rawMessages, _ := payload["messages"].([]any)
+	upstreamMessages, _ := prepared.Payload["messages"].([]any)
 	span.AddEvent("prepare.result", otel_trace.WithAttributes(
 		attribute.Int("messages.count", len(rawMessages)),
+		attribute.Int("messages.upstream_count", len(upstreamMessages)),
 		attribute.Int("patched_count", prepared.PatchedReasoningMessages),
 		attribute.Int("missing_count", prepared.MissingReasoningMessages),
 		attribute.Int("recovered_count", prepared.RecoveredReasoningMessages),
 		attribute.Int("recovery_iterations", len(prepared.RecoverySteps)),
+		attribute.Int("truncated_count", prepared.TruncatedMessages),
+		attribute.Int("truncated_estimated_tokens", prepared.TruncatedEstimatedTokens),
 		attribute.Int("store.lookups", prepared.StoreLookups),
 	))
 

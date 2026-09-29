@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"maps"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -103,38 +105,84 @@ func NormalizeReasoningEffort(value string) string {
 	return "high"
 }
 
-// ParseModelSuffixes extracts a reasoning effort and a thinking toggle encoded
-// as model name suffixes, e.g. "deepseek-flash:max" or "deepseek-flash:low:nothink".
+// ParseModelSuffixes extracts a reasoning effort, a thinking toggle and a
+// history cap encoded as model name suffixes, e.g. "deepseek-flash:max",
+// "deepseek-flash:low:nothink" or "deepseek-flash:nothink:mm200".
+//
+// Suffixes are named and order-independent, following the convention used by
+// OpenAI-compatible routers such as OpenRouter ("model:nitro:exacto"). Every
+// token is inspected on its own, so the position of a token never matters:
+// "low:nothink:mm200" and "mm200:low:nothink" are equivalent.
+//
+// The mmN token overrides the history cap (max_messages) for this request
+// only. It exists because Cursor sends nothing but a model name — there is no
+// other channel to vary the cap per chat without editing config and
+// restarting the proxy.
+//
 // Known suffixes are stripped from the returned model name; the base model is
 // returned unchanged when a suffix is not recognized.
-func ParseModelSuffixes(model string) (base string, effort string, noThink bool) {
+func ParseModelSuffixes(model string) (base string, effort string, noThink bool, maxMessages int) {
 	parts := strings.Split(model, ":")
 	base = parts[0]
 
 	// Only strip suffixes when every part after the base is recognized; an
 	// unknown suffix is left intact so the model is routed upstream as-is.
+	// This keeps names like "deepseek-v4-pro-0528" or a real upstream model
+	// with a colon in it from being silently rewritten.
 	if len(parts) > 1 {
 		for _, p := range parts[1:] {
-			if !strings.EqualFold(p, "nothink") && !isKnownEffort(p) {
-				return model, "", false
+			if !strings.EqualFold(p, "nothink") && !isKnownEffort(p) && !isMaxMessagesToken(p) {
+				return model, "", false, 0
 			}
 		}
 		for _, p := range parts[1:] {
 			switch {
 			case strings.EqualFold(p, "nothink"):
 				noThink = true
+			case isMaxMessagesToken(p):
+				maxMessages = parseMaxMessagesToken(p)
 			case isKnownEffort(p):
 				effort = p
 			}
 		}
 	}
-	return base, effort, noThink
+	return base, effort, noThink, maxMessages
+}
+
+// isMaxMessagesToken reports whether a model suffix token is a history-cap
+// override. Only the explicit "mm" form is accepted ("mm200", "mm0"). A bare
+// number is deliberately rejected: ":120" is ambiguous (model version? cap?)
+// and would silently rewrite odd-but-legitimate model names.
+func isMaxMessagesToken(token string) bool {
+	t := strings.TrimSpace(token)
+	if len(t) < 3 {
+		return false
+	}
+	if (t[0] != 'm' && t[0] != 'M') || (t[1] != 'm' && t[1] != 'M') {
+		return false
+	}
+	for _, r := range t[2:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// parseMaxMessagesToken parses a validated history-cap token. Callers must
+// check isMaxMessagesToken first. Zero disables the cap (no truncation).
+func parseMaxMessagesToken(token string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(token)[2:])
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // ParseEffortFromModel extracts only the reasoning effort suffix from a model
 // name (e.g. "deepseek-flash:max"), stripping it from the returned name.
 func ParseEffortFromModel(model string) (string, string) {
-	base, effort, _ := ParseModelSuffixes(model)
+	base, effort, _, _ := ParseModelSuffixes(model)
 	return base, effort
 }
 
@@ -306,9 +354,17 @@ func PrepareUpstreamRequest(
 		clientModel = cfg.UpstreamModel
 	}
 
-	// A reasoning effort and thinking toggle may be encoded in the model name
-	// suffix (e.g. "deepseek-flash:max" or "deepseek-flash:low:nothink").
-	originalModel, modelEffort, modelNoThink := ParseModelSuffixes(clientModel)
+	// A reasoning effort, thinking toggle and per-request history cap may be
+	// encoded in the model name suffix (e.g. "deepseek-flash:max",
+	// "deepseek-flash:low:nothink", "deepseek-flash:low:nothink:120").
+	originalModel, modelEffort, modelNoThink, modelMaxMessages := ParseModelSuffixes(clientModel)
+
+	// The numeric suffix overrides max_messages for this request only; 0
+	// means "no suffix given" and falls back to the configured value.
+	effectiveMaxMessages := cfg.MaxMessages
+	if modelMaxMessages > 0 {
+		effectiveMaxMessages = modelMaxMessages
+	}
 
 	upstreamModel := upstreamModelFor(originalModel, cfg)
 
@@ -427,20 +483,28 @@ func PrepareUpstreamRequest(
 		}
 	}
 
-	// Main normalization with reasoning repair
+	// Main normalization with reasoning repair.
+	// currentRaw MUST be unpacked (currentRaw...): normalizeMessages takes
+	// variadic any, and passing the slice as a single argument collapses the
+	// entire history into one "user" message (fmt.Sprintf of the []any).
+	// That is exactly what produced truncate.before=1 / upstream_count=1
+	// while messages.count still reported the raw Cursor length (244+).
 	messages, patchedCount, missingIndexes, diagnostics := normalizeMessages(
 		ctx,
 		rs,
 		cacheNamespace,
 		thinkingEnabled,
 		!thinkingDisabled,
-		currentRaw,
+		currentRaw...,
 	)
 
-	// Recovery loop — after recovery, convert back to raw for re-normalization
+	// Recovery loop — after recovery, convert back to raw for re-normalization.
+	// Skip entirely when thinking is disabled (:nothink): upstream returns no
+	// reasoning_content, so "recover missing reasoning" cannot succeed and
+	// would only shrink the conversation to the latest user turn.
 	recoveryLoopCtx, recoveryLoopSpan := otel_ctx.Tracer(ctx).Start(ctx, "transform.recoveryLoop")
 	recoveryIterations := 0
-	for len(missingIndexes) > 0 && cfg.MissingReasoningStrategy == "recover" {
+	for len(missingIndexes) > 0 && thinkingEnabled && cfg.MissingReasoningStrategy == "recover" {
 		recovered, dropped, notice, step := recoverMessagesFromMissingReasoning(messages, missingIndexes)
 		recoverySteps = append(recoverySteps, step)
 		if dropped == 0 {
@@ -473,6 +537,36 @@ func PrepareUpstreamRequest(
 	}
 	recoveryLoopSpan.End()
 
+	// Proactive truncation. Cursor's own context window (200k-300k) fills up
+	// from accumulated history long before DeepSeek's does, and when it fills
+	// Cursor silently self-summarizes and the agent forgets context. Trim the
+	// oldest rounds here so the request stays under the limit we control.
+	debugTruncBefore := len(messages)
+	messages, truncated, truncatedTokens := truncateMessages(messages, effectiveMaxMessages, cfg.MaxPromptTokens)
+	debugTruncAfter := len(messages)
+	if debugTruncSpan := otel_ctx.Tracer(ctx); debugTruncSpan != nil {
+		if _, span := debugTruncSpan.Start(ctx, "transform.truncateMessages"); span.IsRecording() {
+			span.SetAttributes(
+				attribute.Int("truncate.max_messages", effectiveMaxMessages),
+				attribute.Int("truncate.max_prompt_tokens", cfg.MaxPromptTokens),
+				attribute.Int("truncate.before", debugTruncBefore),
+				attribute.Int("truncate.after", debugTruncAfter),
+				attribute.Int("truncate.removed", truncated),
+				attribute.Int("truncate.removed_tokens", truncatedTokens),
+			)
+			span.End()
+		}
+	}
+	if truncated > 0 && thinkingEnabled && cfg.MissingReasoningStrategy == "recover" {
+		// Re-derive the recovery boundary view after truncation so a stale
+		// boundary pointing at dropped history is not carried forward.
+		if boundary := activeMessagesFromRecoveryBoundary(messages); boundary != nil {
+			messages = boundary.messages
+			retiredPrefixMessages += boundary.retiredMessages
+			recoverySteps = append(recoverySteps, boundary.step)
+		}
+	}
+
 	activeRecordScope := conversationScopeFromMessages(messages, cacheNamespace)
 	recordContexts := responseRecordingContexts(
 		&models.ResponseContext{Scope: recordResponseScope, Messages: recordResponseMessages},
@@ -503,6 +597,8 @@ func PrepareUpstreamRequest(
 		ContinuedRecoveryBoundary:  continuedRecoveryBoundary,
 		RetiredPrefixMessages:      retiredPrefixMessages,
 		StoreLookups:               getStoreLookups(ctx),
+		TruncatedMessages:          truncated,
+		TruncatedEstimatedTokens:   truncatedTokens,
 	}
 }
 
@@ -875,6 +971,19 @@ func messageToMap(msg models.Message) map[string]any {
 		"role":    msg.Role,
 		"content": msg.Content,
 	}
+	if msg.Name != "" {
+		m["name"] = msg.Name
+	}
+	// tool_call_id is required by DeepSeek for role=tool. Dropping it here
+	// used to be invisible while the currentRaw-without-... bug collapsed
+	// history to a single message; once that was fixed, upstream started
+	// rejecting with "messages[N]: missing field tool_call_id".
+	if msg.ToolCallID != "" {
+		m["tool_call_id"] = msg.ToolCallID
+	}
+	if msg.Prefix != "" {
+		m["prefix"] = msg.Prefix
+	}
 	if msg.ReasoningContent != "" {
 		m["reasoning_content"] = msg.ReasoningContent
 	}
@@ -992,8 +1101,8 @@ type recoveryBoundaryResult struct {
 
 func activeMessagesFromRecoveryBoundary(messages []models.Message) *recoveryBoundaryResult {
 	recoveryBoundaryIdx := -1
-	for i := len(messages) - 1; i >= 0; i-- {
-		if hasRecoveryNotice(messages[i]) {
+	for i, message := range slices.Backward(messages) {
+		if hasRecoveryNotice(message) {
 			recoveryBoundaryIdx = i
 			break
 		}
@@ -1046,8 +1155,8 @@ func recoverMessagesFromMissingReasoning(
 ) ([]models.Message, int, string, models.RecoveryStep) {
 	// Check for existing recovery boundary
 	recoveryBoundaryIdx := -1
-	for i := len(messages) - 1; i >= 0; i-- {
-		if hasRecoveryNotice(messages[i]) {
+	for i, message := range slices.Backward(messages) {
+		if hasRecoveryNotice(message) {
 			// Check if any missing message is before this boundary
 			for _, mi := range missingIndexes {
 				if mi < i {
@@ -1099,8 +1208,8 @@ func recoverMessagesFromMissingReasoning(
 
 	// Find last user message
 	lastUserIdx := -1
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
+	for i, message := range slices.Backward(messages) {
+		if message.Role == "user" {
 			lastUserIdx = i
 			break
 		}
@@ -1139,8 +1248,8 @@ func assistantNeedsReasoningForToolContext(msg models.Message, priorMessages []m
 		msgs = []models.Message{}
 	}
 
-	for i := len(msgs) - 1; i >= 0; i-- {
-		role := msgs[i].Role
+	for _, msg := range slices.Backward(msgs) {
+		role := msg.Role
 		if role == "tool" {
 			return true
 		}
@@ -1170,6 +1279,143 @@ func prefixResponseContent(response map[string]any, prefix string) bool {
 		return true
 	}
 	return false
+}
+
+// estimateMessageTokens is a coarse, dependency-free token estimate (~4 chars
+// per token, ASCII-ish). It is deliberately rough: its job is to catch orders
+// of magnitude, not to bill tokens. Multi-byte text is over-counted by bytes,
+// which errs on the safe side for a ceiling guard.
+func estimateMessageTokens(msg models.Message) int {
+	n := len(msg.Content) + len(msg.ReasoningContent)
+	for _, tc := range msg.ToolCalls {
+		n += len(tc.Function.Name) + len(tc.Function.Arguments)
+	}
+	return n/4 + 1
+}
+
+// truncateMessages trims the oldest conversation rounds until the message
+// count is within maxMessages and the estimated prompt size is within
+// maxPromptTokens. Zero disables the corresponding limit.
+//
+// Rules:
+//   - system messages are always preserved (they carry the agent's identity
+//     and tool contracts; dropping them breaks the session).
+//   - truncation happens on round boundaries: a "round" starts at a user
+//     message, so the assistant/tool messages that answer it are never
+//     orphaned. A tool message without its preceding assistant tool_call, or
+//     an assistant tool_call without its tool result, is rejected upstream.
+//   - max_messages is therefore a soft cap, not an exact one: the achievable
+//     counts are the round boundaries, so a cap that falls mid-round lands
+//     on the next boundary down. Undershooting is harmless; tearing a round
+//     apart is not.
+//   - the most recent user turn is always kept, so a lone oversized turn is
+//     passed through rather than producing an empty request.
+//
+// It returns the possibly-trimmed messages, how many messages were removed,
+// and the estimated tokens removed.
+func truncateMessages(messages []models.Message, maxMessages, maxPromptTokens int) ([]models.Message, int, int) {
+	// Kill switch: when both limits are disabled, return the input untouched
+	// before doing any work, so the feature costs nothing and cannot alter a
+	// request when it is off. Zero (or negative) disables a limit.
+	if maxMessages <= 0 && maxPromptTokens <= 0 {
+		return messages, 0, 0
+	}
+	if len(messages) == 0 {
+		return messages, 0, 0
+	}
+
+	leading := leadingSystemMessages(messages)
+	rest := messages[len(leading):]
+
+	// Round start indices within `rest`. Index 0 always begins the first
+	// round: if history does not start with a user message, the leading
+	// non-user messages are grouped into that first round.
+	roundStarts := []int{0}
+	for i, msg := range rest {
+		if i > 0 && msg.Role == "user" {
+			roundStarts = append(roundStarts, i)
+		}
+	}
+
+	// Token size of the leading system messages; they always survive, so this
+	// is the floor any candidate cut point starts from.
+	leadingTokens := 0
+	for _, msg := range leading {
+		leadingTokens += estimateMessageTokens(msg)
+	}
+
+	// suffixTokens[i] is the estimated size of rest[i:]. Built once so each
+	// candidate cut point can be evaluated in O(1) instead of re-summing.
+	suffixTokens := make([]int, len(rest)+1)
+	for i := len(rest) - 1; i >= 0; i-- {
+		suffixTokens[i] = suffixTokens[i+1] + estimateMessageTokens(rest[i])
+	}
+
+	// Choose the smallest cut point (largest surviving tail) that satisfies
+	// both limits, walking cut points from the oldest round forward. This
+	// drops the minimum amount of history needed to get under the limits,
+	// preserving as much context as possible.
+	//
+	// Cut points are the round starts, and we never cut past the final round
+	// start: the latest user turn and its answers always survive, so a lone
+	// oversized turn is passed through rather than producing an empty
+	// request. `chosen` stays 0 when nothing needs to be dropped.
+	chosen := 0
+	for r := 0; r < len(roundStarts); r++ {
+		cut := roundStarts[r]
+		keptCount := len(leading) + len(rest) - cut
+		keptTokens := leadingTokens + suffixTokens[cut]
+		if withinLimits(keptCount, keptTokens, maxMessages, maxPromptTokens) {
+			chosen = cut
+			break
+		}
+	}
+	if chosen == 0 {
+		// Either everything already fits (the full history is the first cut
+		// point and it satisfied the limits) or even the latest round alone
+		// exceeds them. In the latter case, fall back to keeping just the
+		// final round: we refuse to cut into it, so it is the best we can do.
+		last := roundStarts[len(roundStarts)-1]
+		if last > 0 {
+			keptCount := len(leading) + len(rest) - last
+			if !withinLimits(keptCount, leadingTokens+suffixTokens[last], maxMessages, maxPromptTokens) {
+				chosen = last
+			}
+		}
+	}
+	if chosen <= 0 || chosen >= len(rest) {
+		// `chosen` is either 0 (nothing to drop / the latest round alone
+		// already exceeds the limits) or degenerate. Never return a trimmed
+		// slice in that case: an unchanged request is always safe, an empty
+		// one never is.
+		return messages, 0, 0
+	}
+
+	kept := make([]models.Message, 0, len(leading)+len(rest)-chosen)
+	kept = append(kept, leading...)
+	kept = append(kept, rest[chosen:]...)
+
+	removedTokens := 0
+	for _, msg := range messages {
+		removedTokens += estimateMessageTokens(msg)
+	}
+	for _, msg := range kept {
+		removedTokens -= estimateMessageTokens(msg)
+	}
+
+	return kept, len(messages) - len(kept), removedTokens
+}
+
+// withinLimits reports whether a candidate kept-message set satisfies both
+// limits. A limit of zero is disabled.
+func withinLimits(keptCount, keptTokens, maxMessages, maxPromptTokens int) bool {
+	if maxMessages > 0 && keptCount > maxMessages {
+		return false
+	}
+	if maxPromptTokens > 0 && keptTokens > maxPromptTokens {
+		return false
+	}
+	return true
 }
 
 func responseRecordingContexts(ctxs ...*models.ResponseContext) []models.ResponseContext {

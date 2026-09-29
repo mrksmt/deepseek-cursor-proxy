@@ -199,6 +199,8 @@ type PreparedRequest struct {
 	ContinuedRecoveryBoundary  bool
 	RetiredPrefixMessages      int
 	StoreLookups               int
+	TruncatedMessages          int
+	TruncatedEstimatedTokens   int
 }
 
 // ResponseContext pairs a scope with prior messages for recording.
@@ -244,6 +246,16 @@ var ReasoningEffortLevels = []string{
 	"low",
 	"high",
 	"max",
+}
+
+// MaxMessagesLevels are per-request history caps selectable via a model name
+// suffix (e.g. "deepseek-flash:low:mm200"). Announced so each cap can be
+// picked straight from Cursor's dropdown. Kept small on purpose: Cursor's
+// model list is a flat dropdown, not a nested menu.
+var MaxMessagesLevels = []int{
+	120,
+	200,
+	300,
 }
 
 // ModelsList are the model IDs to announce.

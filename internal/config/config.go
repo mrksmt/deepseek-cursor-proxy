@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 )
 
@@ -32,6 +33,14 @@ const (
 	defaultReasoningCacheMaxAge     = 30 * 24 * 60 * 60
 	defaultReasoningCacheMaxRows    = 100000
 	defaultMaxConcurrentRequests    = 10
+	defaultOTelServiceName          = "deepseek-cursor-proxy-go"
+	// Truncation defaults. Zero disables the corresponding limit.
+	// max_messages is the primary guard: Cursor's own window (200k-300k)
+	// fills up from accumulated history long before DeepSeek's 1M does, so
+	// trimming by message count is what actually prevents Cursor's silent
+	// self-summarization. max_prompt_tokens is a coarse secondary guard.
+	defaultMaxMessages     = 200
+	defaultMaxPromptTokens = 0
 )
 
 // Config holds all configuration for the proxy.
@@ -55,6 +64,8 @@ type Config struct {
 	Ngrok                       bool    `mapstructure:"ngrok"`
 	NgrokURL                    string  `mapstructure:"ngrok_url"`
 	MaxConcurrentRequests       int     `mapstructure:"max_concurrent_requests"`
+	MaxMessages                 int     `mapstructure:"max_messages"`
+	MaxPromptTokens             int     `mapstructure:"max_prompt_tokens"`
 	OTelEndpoint                string  `mapstructure:"otel_endpoint"`
 	OTelServiceName             string  `mapstructure:"otel_service_name"`
 	ClearReasoningCache         bool    `mapstructure:"-"`
@@ -107,6 +118,8 @@ func NewDefaultConfig() *Config {
 		Verbose:                     defaultVerbose,
 		Ngrok:                       defaultNgrok,
 		MaxConcurrentRequests:       defaultMaxConcurrentRequests,
+		MaxMessages:                 defaultMaxMessages,
+		MaxPromptTokens:             defaultMaxPromptTokens,
 	}
 }
 
@@ -137,6 +150,18 @@ missing_reasoning_strategy: %s
 reasoning_cache_max_age_seconds: %d
 reasoning_cache_max_rows: %d
 max_concurrent_requests: %d
+
+# History truncation. Zero disables the respective limit.
+# max_messages trims the oldest conversation rounds once the message count
+# exceeds it (system messages and the latest user turn are always kept).
+# It is a soft cap: history is cut on round boundaries, so the kept count
+# may land below the cap rather than exactly on it. Default: %d.
+# It can be overridden per request via a named model name suffix, e.g.
+# "deepseek-flash:low:nothink:mm200" or "deepseek-flash:mm300". Suffix order
+# does not matter.
+# max_prompt_tokens is a coarse secondary guard on estimated prompt size.
+max_messages: %d
+max_prompt_tokens: %d
 `,
 		defaultUpstreamBaseURL,
 		defaultUpstreamModel,
@@ -156,6 +181,9 @@ max_concurrent_requests: %d
 		defaultReasoningCacheMaxAge,
 		defaultReasoningCacheMaxRows,
 		defaultMaxConcurrentRequests,
+		defaultMaxMessages,
+		defaultMaxMessages,
+		defaultMaxPromptTokens,
 	)
 }
 
@@ -223,6 +251,8 @@ solving compatibility issues with DeepSeek's thinking-mode tool-call API.`,
 	rootCmd.Flags().String("missing-reasoning-strategy", defaultMissingReasoningStrategy, "Strategy: recover or reject")
 	rootCmd.Flags().Int("reasoning-cache-max-age-seconds", defaultReasoningCacheMaxAge, "Maximum cache row age in seconds")
 	rootCmd.Flags().Int("reasoning-cache-max-rows", defaultReasoningCacheMaxRows, "Maximum cache rows")
+	rootCmd.Flags().Int("max-messages", defaultMaxMessages, "Trim oldest conversation rounds above this message count (0 disables)")
+	rootCmd.Flags().Int("max-prompt-tokens", defaultMaxPromptTokens, "Coarse estimated-prompt-token ceiling (0 disables)")
 	rootCmd.Flags().Bool("display-reasoning", defaultDisplayReasoning, "Mirror reasoning_content into visible content")
 	rootCmd.Flags().Bool("collapsible-reasoning", defaultCollapsibleReasoning, "Use Markdown details for mirrored reasoning")
 	rootCmd.Flags().Bool("cors", defaultCORS, "Send permissive CORS headers")
@@ -230,9 +260,7 @@ solving compatibility issues with DeepSeek's thinking-mode tool-call API.`,
 	rootCmd.Flags().Bool("ngrok", defaultNgrok, "Start an ngrok tunnel")
 	rootCmd.Flags().String("ngrok-url", "", "Reserved ngrok endpoint / custom domain")
 	rootCmd.Flags().String("otel-endpoint", "", "OpenTelemetry OTLP gRPC endpoint (e.g. host.docker.internal:4317)")
-	rootCmd.Flags().String("otel-service-name", "deepseek-cursor-proxy-go", "OpenTelemetry service name")
-	// Note: OTel flags are NOT bound to Viper to avoid pflag defaults overriding env vars.
-	// They are read directly from os.Getenv in LoadConfig.
+	rootCmd.Flags().String("otel-service-name", defaultOTelServiceName, "OpenTelemetry service name")
 	rootCmd.Flags().Bool("clear-reasoning-cache", false, "Clear the reasoning cache and exit")
 
 	// Bind pflags to viper
@@ -253,6 +281,9 @@ solving compatibility issues with DeepSeek's thinking-mode tool-call API.`,
 func LoadConfig(rootCmd *cobra.Command, cfg *Config) error {
 	configPath, _ := rootCmd.Flags().GetString("config")
 
+	// Record the flag set so changed-flag detection can find these flags.
+	RegisterFlagSet(rootCmd.Flags())
+
 	// Ensure default config file exists
 	if configPath != "" {
 		if err := ensureDefaultConfig(configPath); err != nil {
@@ -271,10 +302,43 @@ func LoadConfig(rootCmd *cobra.Command, cfg *Config) error {
 		}
 	}
 
-	// Unmarshal into config struct
-	if err := viper.Unmarshal(cfg); err != nil {
-		return fmt.Errorf("cannot unmarshal config: %w", err)
-	}
+	// Read every value through Viper's Get* rather than Unmarshal.
+	//
+	// Unmarshal does not honor Viper's precedence chain: it builds the result
+	// from the merged config map, where values read from the YAML file sit on
+	// top of values bound from CLI flags. The practical effect was that a value
+	// in config.yaml silently overrode the same flag passed on the command line.
+	//
+	// Viper treats "max-messages" (the pflag name) and "max_messages" (the YAML
+	// key) as two distinct keys, so GetString("host") alone would only ever see
+	// the flag side. getKey resolves a flag-style key against its YAML
+	// underscore equivalent and returns whichever the user actually set.
+	cfg.Host = getStringKey("host")
+	cfg.Port = getIntKey("port")
+	cfg.UpstreamBaseURL = getStringKey("base-url")
+	cfg.UpstreamModel = getStringKey("model")
+	cfg.Thinking = getStringKey("thinking")
+	cfg.ReasoningEffort = getStringKey("reasoning-effort")
+	cfg.RequestTimeout = getFloat64Key("request-timeout")
+	cfg.MaxRequestBodyBytes = getInt64Key("max-request-body-bytes")
+	cfg.ReasoningContentPath = getStringKey("reasoning-content-path")
+	cfg.MissingReasoningStrategy = getStringKey("missing-reasoning-strategy")
+	cfg.ReasoningCacheMaxAgeSeconds = getIntKey("reasoning-cache-max-age-seconds")
+	cfg.ReasoningCacheMaxRows = getIntKey("reasoning-cache-max-rows")
+	cfg.DisplayReasoning = getBoolKey("display-reasoning")
+	cfg.CollapsibleReasoning = getBoolKey("collapsible-reasoning")
+	cfg.CORS = getBoolKey("cors")
+	cfg.Verbose = getBoolKey("verbose")
+	cfg.Ngrok = getBoolKey("ngrok")
+	cfg.NgrokURL = getStringKey("ngrok-url")
+	cfg.MaxConcurrentRequests = getIntKey("max-concurrent-requests")
+	cfg.MaxMessages = getIntKey("max-messages")
+	cfg.MaxPromptTokens = getIntKey("max-prompt-tokens")
+
+	// OTel flags are bound to Viper like the rest; their empty flag defaults
+	// let a config-file or env value take effect when no flag is given.
+	cfg.OTelEndpoint = getStringKey("otel-endpoint")
+	cfg.OTelServiceName = getStringKey("otel-service-name")
 
 	// Normalize values
 	cfg.Thinking = normalizeString(cfg.Thinking, defaultThinking)
@@ -301,15 +365,152 @@ func LoadConfig(rootCmd *cobra.Command, cfg *Config) error {
 	// Check clear-reasoning-cache flag
 	cfg.ClearReasoningCache, _ = rootCmd.Flags().GetBool("clear-reasoning-cache")
 
-	// Read OTel values directly from env to avoid pflag defaults overriding env vars
-	if v := os.Getenv("DEEPSEEK_OTEL_ENDPOINT"); v != "" {
-		cfg.OTelEndpoint = v
-	}
-	if v := os.Getenv("DEEPSEEK_OTEL_SERVICE_NAME"); v != "" {
-		cfg.OTelServiceName = v
-	}
-
 	return nil
+}
+
+// Viper keeps a flag-style key ("max-messages") and its YAML spelling
+// ("max_messages") as two separate entries; neither overwrites the other.
+// These helpers resolve a value against both, preferring whichever the user
+// actually provided, so precedence ends up as:
+//
+//	CLI flag > env var > config file (either spelling) > flag default
+//
+// A CLI flag is detected via pflag's Changed, because its bound default is
+// always present and would otherwise mask the file.
+func getStringKey(key string) string {
+	if v, ok := changedOrSetString(key); ok {
+		return v
+	}
+	return viper.GetString(key)
+}
+
+func getIntKey(key string) int {
+	if v, ok := changedOrSetInt(key); ok {
+		return v
+	}
+	return viper.GetInt(key)
+}
+
+func getInt64Key(key string) int64 {
+	if v, ok := changedOrSetInt64(key); ok {
+		return v
+	}
+	return viper.GetInt64(key)
+}
+
+func getFloat64Key(key string) float64 {
+	if v, ok := changedOrSetFloat64(key); ok {
+		return v
+	}
+	return viper.GetFloat64(key)
+}
+
+func getBoolKey(key string) bool {
+	if v, ok := changedOrSetBool(key); ok {
+		return v
+	}
+	return viper.GetBool(key)
+}
+
+// yamlKey converts a flag-style key to its YAML spelling.
+func yamlKey(key string) string { return strings.ReplaceAll(key, "-", "_") }
+
+func changedOrSetString(key string) (string, bool) {
+	if f := lookupFlag(key); f != nil && f.Changed {
+		return viper.GetString(key), true
+	}
+	if viper.InConfig(yamlKey(key)) {
+		return viper.GetString(yamlKey(key)), true
+	}
+	if v := os.Getenv(envName(key)); v != "" {
+		return v, true
+	}
+	return "", false
+}
+
+func changedOrSetInt(key string) (int, bool) {
+	if f := lookupFlag(key); f != nil && f.Changed {
+		return viper.GetInt(key), true
+	}
+	if viper.InConfig(yamlKey(key)) {
+		return viper.GetInt(yamlKey(key)), true
+	}
+	if v := os.Getenv(envName(key)); v != "" {
+		return viper.GetInt(key), true
+	}
+	return 0, false
+}
+
+func changedOrSetInt64(key string) (int64, bool) {
+	if f := lookupFlag(key); f != nil && f.Changed {
+		return viper.GetInt64(key), true
+	}
+	if viper.InConfig(yamlKey(key)) {
+		return viper.GetInt64(yamlKey(key)), true
+	}
+	if v := os.Getenv(envName(key)); v != "" {
+		return viper.GetInt64(key), true
+	}
+	return 0, false
+}
+
+func changedOrSetFloat64(key string) (float64, bool) {
+	if f := lookupFlag(key); f != nil && f.Changed {
+		return viper.GetFloat64(key), true
+	}
+	if viper.InConfig(yamlKey(key)) {
+		return viper.GetFloat64(yamlKey(key)), true
+	}
+	if v := os.Getenv(envName(key)); v != "" {
+		return viper.GetFloat64(key), true
+	}
+	return 0, false
+}
+
+func changedOrSetBool(key string) (bool, bool) {
+	if f := lookupFlag(key); f != nil && f.Changed {
+		return viper.GetBool(key), true
+	}
+	if viper.InConfig(yamlKey(key)) {
+		return viper.GetBool(yamlKey(key)), true
+	}
+	if v := os.Getenv(envName(key)); v != "" {
+		return viper.GetBool(key), true
+	}
+	return false, false
+}
+
+// lookupFlag returns the bound pflag for a Viper key, or nil when the key has
+// no flag. BindPFlags stores the flag set privately, so the command that owns
+// the flags is recorded once at wiring time and consulted here.
+func lookupFlag(key string) *pflag.Flag {
+	for _, fs := range flagSets {
+		if f := fs.Lookup(key); f != nil {
+			return f
+		}
+	}
+	return nil
+}
+
+// flagSets holds every pflag set bound to Viper. BindPFlags is called from
+// BuildRootCommand; registering the set here keeps changed-flag detection
+// working for flags that never enter the process-wide pflag.CommandLine.
+var flagSets []*pflag.FlagSet
+
+// RegisterFlagSet records a flag set for later changed-flag lookups. It
+// replaces any previously recorded set, so repeated LoadConfig calls across
+// tests do not see stale flags.
+func RegisterFlagSet(fs *pflag.FlagSet) {
+	flagSets = nil
+	if fs == nil {
+		return
+	}
+	flagSets = append(flagSets, fs)
+}
+
+// envName maps a flag-style key to its DEEPSEEK_* environment variable.
+func envName(key string) string {
+	return "DEEPSEEK_" + strings.ToUpper(strings.ReplaceAll(key, "-", "_"))
 }
 
 func normalizeString(val, defaultVal string) string {
@@ -333,6 +534,12 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxConcurrentRequests < 1 {
 		return fmt.Errorf("max_concurrent_requests must be at least 1")
+	}
+	if c.MaxMessages < 0 {
+		return fmt.Errorf("max_messages must be >= 0, got %d", c.MaxMessages)
+	}
+	if c.MaxPromptTokens < 0 {
+		return fmt.Errorf("max_prompt_tokens must be >= 0, got %d", c.MaxPromptTokens)
 	}
 	return nil
 }

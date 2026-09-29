@@ -53,6 +53,8 @@ add_string_flag DEEPSEEK_REQUEST_TIMEOUT request-timeout
 add_string_flag DEEPSEEK_MAX_REQUEST_BODY_BYTES max-request-body-bytes
 add_string_flag DEEPSEEK_REASONING_CACHE_MAX_AGE_SECONDS reasoning-cache-max-age-seconds
 add_string_flag DEEPSEEK_REASONING_CACHE_MAX_ROWS reasoning-cache-max-rows
+add_string_flag DEEPSEEK_MAX_MESSAGES max-messages
+add_string_flag DEEPSEEK_MAX_PROMPT_TOKENS max-prompt-tokens
 add_string_flag DEEPSEEK_MISSING_REASONING_STRATEGY missing-reasoning-strategy
 if [ "${DEEPSEEK_CLEAR_REASONING_CACHE:-}" = "1" ] || [ "${DEEPSEEK_CLEAR_REASONING_CACHE:-}" = "true" ]; then
     ARGS="$ARGS --clear-reasoning-cache"

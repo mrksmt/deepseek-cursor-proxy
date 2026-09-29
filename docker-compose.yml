@@ -28,6 +28,14 @@ services:
       # - DEEPSEEK_CORS=true
       - DEEPSEEK_REQUEST_TIMEOUT=120
       # - DEEPSEEK_MAX_REQUEST_BODY_BYTES=20971520
+      # Trim oldest conversation rounds above this message count (0 disables).
+      # Cursor's own window (200k-300k) fills from accumulated history long
+      # before DeepSeek's does, so this is what prevents Cursor's silent
+      # self-summarization. Soft cap: cuts land on round boundaries.
+      # Per-request override via a named model suffix, e.g. "deepseek-flash:mm120".
+# Suffix order does not matter: "deepseek-flash:nothink:mm200:low" also works.
+      - DEEPSEEK_MAX_MESSAGES=200
+      # - DEEPSEEK_MAX_PROMPT_TOKENS=0
       - DEEPSEEK_NGROK=${DEEPSEEK_NGROK:-true}
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
       # OpenTelemetry tracing via OTLP gRPC.
