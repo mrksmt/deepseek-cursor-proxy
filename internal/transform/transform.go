@@ -576,6 +576,13 @@ func PrepareUpstreamRequest(
 	// Strip recovery notice for upstream
 	prepared["messages"] = stripRecoveryNoticeForUpstream(messages)
 
+	// Never re-show the notice once this conversation already recovered —
+	// continued boundary (or a preserved marker in history) means the user
+	// already saw it; injecting again every turn is pure spam in Cursor.
+	if continuedRecoveryBoundary || messagesContainRecoveryNotice(messages) {
+		recoveryNotice = ""
+	}
+
 	return &models.PreparedRequest{
 		Payload:                    prepared,
 		OriginalModel:              clientModel,
@@ -897,7 +904,16 @@ func normalizeMessage(
 	}
 
 	if normalized.Role == "assistant" {
+		// Cursor often wraps prior assistant content (including our recovery
+		// notice) in a Thinking <details> block when resending history. If we
+		// strip that block wholesale, hasRecoveryNotice goes false and every
+		// subsequent turn re-runs latest_user recovery + re-injects the notice
+		// into the SSE stream. Preserve a marker across the strip.
+		hadRecoveryNotice := strings.Contains(normalized.Content, RecoveryNoticeText)
 		normalized.Content = StripCursorThinkingBlocks(normalized.Content)
+		if hadRecoveryNotice && !strings.Contains(normalized.Content, RecoveryNoticeText) {
+			normalized.Content = RecoveryNoticeContent + normalized.Content
+		}
 	}
 
 	patched = false
@@ -1064,7 +1080,11 @@ func messagesToRaw(messages []models.Message) []any {
 }
 
 func hasRecoveryNotice(msg models.Message) bool {
-	return msg.Role == "assistant" && strings.HasPrefix(msg.Content, RecoveryNoticeText)
+	return msg.Role == "assistant" && strings.Contains(msg.Content, RecoveryNoticeText)
+}
+
+func messagesContainRecoveryNotice(messages []models.Message) bool {
+	return slices.ContainsFunc(messages, hasRecoveryNotice)
 }
 
 func stripRecoveryNoticeForUpstream(messages []models.Message) []any {

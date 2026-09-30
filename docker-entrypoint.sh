@@ -1,10 +1,27 @@
 #!/bin/sh
 set -eu
 
-# ── ngrok authtoken setup ──────────────────────────────────────────────────
+# ── ngrok agent config (authtoken + heartbeat) ─────────────────────────────
+# Free ngrok drops the session on heartbeat timeout during large Cursor POSTs
+# (~250–700KB). Raising tolerance reduces false reconnects mid-upload.
+# Defaults: interval 45s, tolerance 120s (ngrok defaults are 10s / 15s).
+# Large Cursor POSTs (~0.2–1MB) can take 10–30s+ to arrive over free ngrok;
+# a short tolerance kills the session mid-upload. Override via env if needed.
 if [ -n "${NGROK_AUTHTOKEN:-}" ]; then
-    ngrok config add-authtoken "$NGROK_AUTHTOKEN" 2>/dev/null || \
-        echo "[entrypoint] warning: failed to configure ngrok authtoken" >&2
+    NGROK_CFG_DIR="${HOME:-/root}/.config/ngrok"
+    mkdir -p "$NGROK_CFG_DIR"
+    # Restrict perms: file contains the authtoken.
+    umask 077
+    cat >"$NGROK_CFG_DIR/ngrok.yml" <<EOF
+version: "3"
+agent:
+  authtoken: ${NGROK_AUTHTOKEN}
+  heartbeat_interval: ${NGROK_HEARTBEAT_INTERVAL:-45s}
+  heartbeat_tolerance: ${NGROK_HEARTBEAT_TOLERANCE:-120s}
+EOF
+    if ! ngrok config check >/dev/null 2>&1; then
+        echo "[entrypoint] warning: ngrok config check failed" >&2
+    fi
 fi
 
 # ── Environment variable to CLI argument mapping ───────────────────────────

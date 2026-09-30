@@ -125,6 +125,8 @@ docker run -d --name jaeger \
 | `DEEPSEEK_MAX_MESSAGES` | `0` (выключено) | Обрезка истории: держать не больше N сообщений |
 | `DEEPSEEK_MAX_PROMPT_TOKENS` | `0` (выключено) | Грубый потолок оценочного размера промпта |
 | `NGROK_AUTHTOKEN` | — | Токен ngrok (обязателен) |
+| `NGROK_HEARTBEAT_INTERVAL` | `45s` | Как часто агент шлёт heartbeat (дефолт ngrok: `10s`) |
+| `NGROK_HEARTBEAT_TOLERANCE` | `120s` | Сколько ждать ответ до reconnect (дефолт ngrok: `15s`) |
 
 Полный пример в [`config.example.yaml`](config.example.yaml).
 

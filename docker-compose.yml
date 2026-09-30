@@ -38,6 +38,9 @@ services:
       # - DEEPSEEK_MAX_PROMPT_TOKENS=0
       - DEEPSEEK_NGROK=${DEEPSEEK_NGROK:-true}
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+      # Softer heartbeats for large Cursor uploads (see docker-entrypoint.sh).
+      - NGROK_HEARTBEAT_INTERVAL=${NGROK_HEARTBEAT_INTERVAL:-45s}
+      - NGROK_HEARTBEAT_TOLERANCE=${NGROK_HEARTBEAT_TOLERANCE:-120s}
       # OpenTelemetry tracing via OTLP gRPC.
       # The local collector container owns host port 14317 (-> container 4317),
       # so from inside this container the host address is host.docker.internal:14317.
