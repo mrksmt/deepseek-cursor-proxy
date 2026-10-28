@@ -1,6 +1,10 @@
 package models
 
-import "time"
+import (
+	"time"
+
+	"github.com/uptrace/bun"
+)
 
 // ChatCompletionRequest represents an incoming chat completion request.
 type ChatCompletionRequest struct {
@@ -201,6 +205,15 @@ type PreparedRequest struct {
 	StoreLookups               int
 	TruncatedMessages          int
 	TruncatedEstimatedTokens   int
+	// TruncationSkipped is true when the thinking-recovery path bypassed the
+	// history cap to avoid orphaning a tool_call/tool pair.
+	TruncationSkipped bool
+	// DroppedTools counts tools DeepSeek cannot accept (e.g. Cursor's
+	// {"type":"custom"} free-form tools) that were removed to keep the request
+	// valid. ToolChoiceNote explains a tool_choice that had to be changed or
+	// dropped ("thinking_mode_unsupported", "tool_not_available", "no_tools").
+	DroppedTools   int
+	ToolChoiceNote string
 }
 
 // ResponseContext pairs a scope with prior messages for recording.
@@ -232,7 +245,16 @@ type RecoveryStep struct {
 }
 
 // ReasoningCacheEntry is the SQLite storage model for reasoning content.
+// ReasoningCacheEntry is one cached reasoning block.
+//
+// The table name is pinned: bun would otherwise pluralize the struct name to
+// "reasoning_cache_entries", while the raw SQL in this package (row-cap
+// pruning) and every database written by the Python version use
+// "reasoning_cache". A mismatch is not cosmetic — it broke startup on a fresh
+// database and made row-cap pruning a no-op.
 type ReasoningCacheEntry struct {
+	bun.BaseModel `bun:"table:reasoning_cache"`
+
 	Key         string    `bun:",pk"`
 	Reasoning   string    `bun:",notnull"`
 	MessageJSON string    `bun:",notnull"`

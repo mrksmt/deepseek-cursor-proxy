@@ -289,6 +289,116 @@ func LegacyFunctionToTool(function map[string]any) map[string]any {
 	}
 }
 
+// NormalizeTools keeps only the tools DeepSeek can actually accept and reports
+// a label for each dropped one.
+//
+// DeepSeek only understands {"type":"function"} tools with a non-empty name.
+// Cursor sends OpenAI free-form tools ({"type":"custom", ...}) when a GPT-named
+// model is selected, and upstream then rejects the WHOLE request with
+// `tools[i].type: unknown variant `custom`, expected `function“ (422) — one
+// stray tool kills every function tool next to it. Dropping the offender keeps
+// the request alive.
+func NormalizeTools(raw []any) (tools []any, dropped []string) {
+	tools = make([]any, 0, len(raw))
+	for _, t := range raw {
+		tMap, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		normalized := NormalizeTool(tMap)
+		toolType, _ := normalized["type"].(string)
+		fn, _ := normalized["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		if toolType != "function" || strings.TrimSpace(name) == "" {
+			dropped = append(dropped, droppedToolLabel(normalized))
+			continue
+		}
+		tools = append(tools, normalized)
+	}
+	return tools, dropped
+}
+
+// droppedToolLabel names a dropped tool as precisely as the payload allows so
+// the trace says which tool vanished instead of just "one tool".
+func droppedToolLabel(tool map[string]any) string {
+	if custom, ok := tool["custom"].(map[string]any); ok {
+		if name, _ := custom["name"].(string); name != "" {
+			return name
+		}
+	}
+	if fn, ok := tool["function"].(map[string]any); ok {
+		if name, _ := fn["name"].(string); name != "" {
+			return name
+		}
+	}
+	if name, _ := tool["name"].(string); name != "" {
+		return name
+	}
+	if toolType, _ := tool["type"].(string); toolType != "" {
+		return "<unnamed:" + toolType + ">"
+	}
+	return "<unnamed>"
+}
+
+// toolNamesOf collects the names of the tools that survived normalization.
+func toolNamesOf(tools []any) map[string]bool {
+	names := make(map[string]bool, len(tools))
+	for _, t := range tools {
+		tMap, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		if fn, ok := tMap["function"].(map[string]any); ok {
+			if name, _ := fn["name"].(string); name != "" {
+				names[name] = true
+			}
+		}
+	}
+	return names
+}
+
+// namedToolChoice reports whether the choice forces one specific function, and
+// which one.
+func namedToolChoice(choice any) (named bool, name string) {
+	m, ok := choice.(map[string]any)
+	if !ok {
+		return false, ""
+	}
+	fn, ok := m["function"].(map[string]any)
+	if !ok {
+		return false, ""
+	}
+	name, _ = fn["name"].(string)
+	return name != "", name
+}
+
+// resolveToolChoice adjusts a tool_choice to what DeepSeek accepts for the
+// active thinking mode and tool set. A nil result means "omit the field".
+//
+// Two upstream rules drive this:
+//   - Thinking mode rejects `required` and named choices outright:
+//     "Thinking mode does not support this tool_choice" (400). Downgrading to
+//     `auto` keeps the request alive; the model still usually calls the tool.
+//   - A choice naming a tool we just dropped is invalid, so it is dropped too.
+func resolveToolChoice(choice any, toolNames map[string]bool, hasTools, thinkingEnabled bool) (any, string) {
+	normalized := NormalizeToolChoice(choice)
+	if normalized == nil {
+		return nil, ""
+	}
+	if !hasTools {
+		return nil, "no_tools"
+	}
+
+	named, name := namedToolChoice(normalized)
+	if thinkingEnabled && (named || normalized == "required") {
+		return "auto", "thinking_mode_unsupported"
+	}
+	if named && !toolNames[name] {
+		return "auto", "tool_not_available"
+	}
+	return normalized, ""
+}
+
 // NormalizeToolChoice normalizes a tool_choice value.
 func NormalizeToolChoice(toolChoice any) any {
 	switch v := toolChoice.(type) {
@@ -395,35 +505,27 @@ func PrepareUpstreamRequest(
 		prepared["stream_options"] = streamOpts
 	}
 
-	// Normalize tools
+	// Normalize tools and tool_choice AFTER the thinking mode is known: which
+	// tool_choice values are legal depends on it (see resolveToolChoice).
+	// Both are collected here and applied below.
+	var rawTools []any
 	if tools, ok := prepared["tools"].([]any); ok {
-		normalizedTools := make([]any, 0, len(tools))
-		for _, t := range tools {
-			if tMap, ok := t.(map[string]any); ok {
-				normalizedTools = append(normalizedTools, NormalizeTool(tMap))
-			}
-		}
-		prepared["tools"] = normalizedTools
+		rawTools = tools
 	} else if functions, ok := payload["functions"].([]any); ok {
-		tools := make([]any, 0, len(functions))
 		for _, f := range functions {
 			if fMap, ok := f.(map[string]any); ok {
-				tools = append(tools, LegacyFunctionToTool(fMap))
+				rawTools = append(rawTools, LegacyFunctionToTool(fMap))
 			}
 		}
-		prepared["tools"] = tools
 	}
 
-	// Normalize tool_choice
+	requestedChoice, hasChoice := any(nil), false
 	if tc, ok := prepared["tool_choice"]; ok {
-		if normalized := NormalizeToolChoice(tc); normalized != nil {
-			prepared["tool_choice"] = normalized
-		} else {
-			delete(prepared, "tool_choice")
-		}
+		requestedChoice, hasChoice = tc, true
+		delete(prepared, "tool_choice")
 	} else if fc, ok := payload["function_call"]; ok {
 		if normalized := ConvertFunctionCall(fc); normalized != nil {
-			prepared["tool_choice"] = normalized
+			requestedChoice, hasChoice = normalized, true
 		}
 	}
 
@@ -447,6 +549,26 @@ func PrepareUpstreamRequest(
 	if thinkingEnabled {
 		upstreamEffort = NormalizeReasoningEffort(effort)
 		prepared["reasoning_effort"] = upstreamEffort
+	}
+
+	// Apply the deferred tool normalization now that thinking mode is known.
+	tools, droppedTools := NormalizeTools(rawTools)
+	toolNames := toolNamesOf(tools)
+	if len(tools) > 0 {
+		prepared["tools"] = tools
+	} else {
+		// No usable tools: forwarding an empty list (or a tool_choice) would
+		// only give upstream another reason to reject the request.
+		delete(prepared, "tools")
+	}
+	toolChoiceNote := ""
+	if hasChoice {
+		if choice, note := resolveToolChoice(requestedChoice, toolNames, len(tools) > 0, thinkingEnabled); choice != nil {
+			prepared["tool_choice"] = choice
+			toolChoiceNote = note
+		} else {
+			toolChoiceNote = note
+		}
 	}
 
 	// Compute cache namespace
@@ -473,11 +595,16 @@ func PrepareUpstreamRequest(
 	recoveryNotice := ""
 	var recoverySteps []models.RecoveryStep
 
-	// Check for existing recovery boundary
+	// Check for existing recovery boundary.
+	//
+	// This branch used to RE-CUT history to the stored boundary on every turn.
+	// With missingIndexes empty (nothing actually lost) that is a pure no-op in
+	// the best case and, once latest_user compounded it, collapsed the request
+	// to ~4 messages every turn — the agent lost its own prior steps and looped.
+	// The boundary marker stays in history for the model to see; it must not
+	// trigger another cut. Only genuine missing reasoning may shrink history.
 	if thinkingEnabled && cfg.MissingReasoningStrategy == "recover" {
 		if boundary := activeMessagesFromRecoveryBoundary(preRepairMessages); boundary != nil {
-			currentRaw = messagesToRaw(boundary.messages)
-			retiredPrefixMessages = boundary.retiredMessages
 			continuedRecoveryBoundary = true
 			recoverySteps = append(recoverySteps, boundary.step)
 		}
@@ -498,41 +625,34 @@ func PrepareUpstreamRequest(
 		currentRaw...,
 	)
 
-	// Recovery loop — after recovery, convert back to raw for re-normalization.
-	// Skip entirely when thinking is disabled (:nothink): upstream returns no
-	// reasoning_content, so "recover missing reasoning" cannot succeed and
-	// would only shrink the conversation to the latest user turn.
-	recoveryLoopCtx, recoveryLoopSpan := otel_ctx.Tracer(ctx).Start(ctx, "transform.recoveryLoop")
-	recoveryIterations := 0
-	for len(missingIndexes) > 0 && thinkingEnabled && cfg.MissingReasoningStrategy == "recover" {
-		recovered, dropped, notice, step := recoverMessagesFromMissingReasoning(messages, missingIndexes)
-		recoverySteps = append(recoverySteps, step)
-		if dropped == 0 {
-			break
-		}
-		recoveryIterations++
-		recoveredCount += len(missingIndexes)
-		recoveryDropped += dropped
-		if notice != "" {
-			recoveryNotice = notice
-		}
-		recoveredRaw := messagesToRaw(recovered)
-		var latestDiags []models.ReasoningDiagnostic
-		messages, patchedCount, missingIndexes, latestDiags = normalizeMessages(
-			recoveryLoopCtx,
-			rs,
-			cacheNamespace,
-			thinkingEnabled,
-			!thinkingDisabled,
-			recoveredRaw...,
-		)
-		diagnostics = append(diagnostics, latestDiags...)
+	// Recovery span. Skip the work when thinking is disabled (:nothink):
+	// upstream returns no reasoning_content, so "recover missing reasoning"
+	// cannot succeed and the old code shrank the conversation to the last user
+	// turn for no gain.
+	_, recoveryLoopSpan := otel_ctx.Tracer(ctx).Start(ctx, "transform.recoveryLoop")
+	// Recovery never cuts history. Every cut path (recovery_boundary and
+	// latest_user) removed saved history to make upstream accept the request,
+	// but truncation and recovery mutated the same list while the missing
+	// indexes were renumbered underneath them. Each pass therefore cut deeper
+	// and the conversation collapsed to a handful of messages (300 -> 4), so
+	// the agent forgot its own prior tool calls and repeated them in a loop.
+	// Repairing reasoning content is this loop's job; the repair itself happens
+	// in the normalizeMessages call above, which fills reasoning from the cache.
+	//
+	// Only a diagnostic step is recorded so traces show why recovery was
+	// entered, without touching the message list.
+	if len(missingIndexes) > 0 && thinkingEnabled && cfg.MissingReasoningStrategy == "recover" {
+		recoverySteps = append(recoverySteps, models.RecoveryStep{
+			Strategy:       "none",
+			MissingIndexes: missingIndexes,
+		})
 	}
 	if recoveryLoopSpan.IsRecording() {
 		recoveryLoopSpan.SetAttributes(
-			attribute.Int("recovery.iterations", recoveryIterations),
 			attribute.Int("recovery.recovered", recoveredCount),
 			attribute.Int("recovery.dropped", recoveryDropped),
+			attribute.String("recovery.strategies", recoveryStrategySummary(recoverySteps)),
+			attribute.Bool("recovery.latest_user_fired", recoveryLatestUserFired(recoverySteps)),
 		)
 	}
 	recoveryLoopSpan.End()
@@ -541,8 +661,21 @@ func PrepareUpstreamRequest(
 	// from accumulated history long before DeepSeek's does, and when it fills
 	// Cursor silently self-summarizes and the agent forgets context. Trim the
 	// oldest rounds here so the request stays under the limit we control.
+	//
+	// NEVER truncate while the thinking loop is active. A thinking turn ends in
+	// a tool_call, so a naive round-boundary cut drops the assistant tool_call
+	// / tool result pair. Upstream then rejects the request ("assistant message
+	// with tool_calls must be followed by tool messages"), the agent retries the
+	// same call, and the conversation spins in place — the "looping" symptom.
+	// :nothink turns carry no reasoning/tool-call pairing to preserve, so the
+	// history cap still applies there.
+	truncationSkipped := thinkingEnabled && cfg.MissingReasoningStrategy == "recover"
 	debugTruncBefore := len(messages)
-	messages, truncated, truncatedTokens := truncateMessages(messages, effectiveMaxMessages, cfg.MaxPromptTokens)
+	truncated := 0
+	truncatedTokens := 0
+	if !truncationSkipped {
+		messages, truncated, truncatedTokens = truncateMessages(messages, effectiveMaxMessages, cfg.MaxPromptTokens)
+	}
 	debugTruncAfter := len(messages)
 	if debugTruncSpan := otel_ctx.Tracer(ctx); debugTruncSpan != nil {
 		if _, span := debugTruncSpan.Start(ctx, "transform.truncateMessages"); span.IsRecording() {
@@ -553,16 +686,17 @@ func PrepareUpstreamRequest(
 				attribute.Int("truncate.after", debugTruncAfter),
 				attribute.Int("truncate.removed", truncated),
 				attribute.Int("truncate.removed_tokens", truncatedTokens),
+				attribute.Bool("truncate.skipped", truncationSkipped),
+				attribute.String("truncate.skip_reason", truncationSkipReason(truncationSkipped)),
 			)
 			span.End()
 		}
 	}
 	if truncated > 0 && thinkingEnabled && cfg.MissingReasoningStrategy == "recover" {
 		// Re-derive the recovery boundary view after truncation so a stale
-		// boundary pointing at dropped history is not carried forward.
+		// boundary pointing at dropped history is not carried forward. Only the
+		// diagnostic step is recorded; messages must not be cut again here.
 		if boundary := activeMessagesFromRecoveryBoundary(messages); boundary != nil {
-			messages = boundary.messages
-			retiredPrefixMessages += boundary.retiredMessages
 			recoverySteps = append(recoverySteps, boundary.step)
 		}
 	}
@@ -606,7 +740,49 @@ func PrepareUpstreamRequest(
 		StoreLookups:               getStoreLookups(ctx),
 		TruncatedMessages:          truncated,
 		TruncatedEstimatedTokens:   truncatedTokens,
+		TruncationSkipped:          truncationSkipped,
+		DroppedTools:               len(droppedTools),
+		ToolChoiceNote:             toolChoiceNote,
 	}
+}
+
+// truncationSkipReason names why truncation was bypassed, for trace attributes.
+func truncationSkipReason(skipped bool) string {
+	if !skipped {
+		return "none"
+	}
+	return "thinking_recovery_active"
+}
+
+// recoveryStrategySummary lists, in order, the recovery strategies that fired
+// during a request (e.g. "latest_user", "recovery_boundary"). Recorded on the
+// recovery span so a nuke-to-last-user shows up without re-reading the payload.
+func recoveryStrategySummary(steps []models.RecoveryStep) string {
+	if len(steps) == 0 {
+		return "none"
+	}
+	seen := make([]string, 0, len(steps))
+	for _, s := range steps {
+		if s.Strategy == "" || s.Strategy == "none" {
+			continue
+		}
+		seen = append(seen, s.Strategy)
+	}
+	if len(seen) == 0 {
+		return "none"
+	}
+	return strings.Join(seen, ",")
+}
+
+// recoveryLatestUserFired reports whether the destructive latest_user strategy
+// (history collapsed to the last user turn) ran for this request.
+func recoveryLatestUserFired(steps []models.RecoveryStep) bool {
+	for _, s := range steps {
+		if s.Strategy == "latest_user" {
+			return true
+		}
+	}
+	return false
 }
 
 // RecordResponseReasoning stores reasoning from a response into the cache.
@@ -1166,95 +1342,6 @@ func activeMessagesFromRecoveryBoundary(messages []models.Message) *recoveryBoun
 			ContextUserIndex:      userIdx,
 			DroppedMessages:       retired,
 		},
-	}
-}
-
-func recoverMessagesFromMissingReasoning(
-	messages []models.Message,
-	missingIndexes []int,
-) ([]models.Message, int, string, models.RecoveryStep) {
-	// Check for existing recovery boundary
-	recoveryBoundaryIdx := -1
-	for i, message := range slices.Backward(messages) {
-		if hasRecoveryNotice(message) {
-			// Check if any missing message is before this boundary
-			for _, mi := range missingIndexes {
-				if mi < i {
-					recoveryBoundaryIdx = i
-					break
-				}
-			}
-			if recoveryBoundaryIdx != -1 {
-				break
-			}
-		}
-	}
-
-	if recoveryBoundaryIdx != -1 {
-		userIdx := -1
-		for i := recoveryBoundaryIdx - 1; i >= 0; i-- {
-			if messages[i].Role == "user" {
-				userIdx = i
-				break
-			}
-		}
-
-		leadingMsgs := leadingSystemMessages(messages)
-		var recoveredTail []models.Message
-		if userIdx != -1 {
-			recoveredTail = append(recoveredTail, messages[userIdx])
-		}
-		recoveredTail = append(recoveredTail, messages[recoveryBoundaryIdx:]...)
-
-		recovered := make([]models.Message, 0, len(leadingMsgs)+1+len(recoveredTail))
-		recovered = append(recovered, leadingMsgs...)
-		recovered = append(recovered, models.Message{Role: "system", Content: RecoverySystemContent})
-		recovered = append(recovered, recoveredTail...)
-
-		keptContext := 0
-		if userIdx != -1 {
-			keptContext = 1
-		}
-		omitted := max(recoveryBoundaryIdx-len(leadingMsgs)-keptContext, 0)
-
-		return recovered, omitted, "", models.RecoveryStep{
-			Strategy:              "recovery_boundary",
-			MissingIndexes:        missingIndexes,
-			RecoveryBoundaryIndex: recoveryBoundaryIdx,
-			ContextUserIndex:      userIdx,
-			DroppedMessages:       omitted,
-		}
-	}
-
-	// Find last user message
-	lastUserIdx := -1
-	for i, message := range slices.Backward(messages) {
-		if message.Role == "user" {
-			lastUserIdx = i
-			break
-		}
-	}
-
-	if lastUserIdx == -1 {
-		return messages, 0, "", models.RecoveryStep{
-			Strategy:        "none",
-			MissingIndexes:  missingIndexes,
-			DroppedMessages: 0,
-		}
-	}
-
-	leadingMsgs := leadingSystemMessages(messages)
-	omitted := len(messages) - len(leadingMsgs) - 1
-	recovered := make([]models.Message, 0, len(leadingMsgs)+2)
-	recovered = append(recovered, leadingMsgs...)
-	recovered = append(recovered, models.Message{Role: "system", Content: RecoverySystemContent})
-	recovered = append(recovered, messages[lastUserIdx])
-
-	return recovered, omitted, RecoveryNoticeContent, models.RecoveryStep{
-		Strategy:        "latest_user",
-		MissingIndexes:  missingIndexes,
-		DroppedMessages: omitted,
-		Notice:          RecoveryNoticeContent,
 	}
 }
 

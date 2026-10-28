@@ -393,7 +393,10 @@ func (s *ProxyServer) prepareUpstream(
 		attribute.Int("recovery_iterations", len(prepared.RecoverySteps)),
 		attribute.Int("truncated_count", prepared.TruncatedMessages),
 		attribute.Int("truncated_estimated_tokens", prepared.TruncatedEstimatedTokens),
+		attribute.Bool("truncation_skipped", prepared.TruncationSkipped),
 		attribute.Int("store.lookups", prepared.StoreLookups),
+		attribute.Int("tools.dropped", prepared.DroppedTools),
+		attribute.String("tool_choice.note", prepared.ToolChoiceNote),
 	))
 
 	if prepared.MissingReasoningMessages > 0 && s.cfg.MissingReasoningStrategy == "reject" {

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"maps"
 	"os"
 	"path/filepath"
@@ -23,6 +24,66 @@ import (
 	"github.com/mrksmt/deepseek-cursor-proxy/internal/models"
 	"github.com/mrksmt/deepseek-cursor-proxy/internal/otel_ctx"
 )
+
+// tableExists reports whether a table is present in the SQLite database.
+func tableExists(ctx context.Context, db *bun.DB, name string) (bool, error) {
+	var count int
+	if err := db.NewRaw(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", name,
+	).Scan(ctx, &count); err != nil {
+		return false, fmt.Errorf("cannot inspect sqlite schema for %s: %w", name, err)
+	}
+	return count > 0, nil
+}
+
+// migrateLegacyCacheTable adopts a "reasoning_cache_entries" table left behind
+// by builds that let bun pluralize the struct name.
+//
+// Those builds wrote every row there while the index and row-cap pruning still
+// referenced "reasoning_cache", so upgrading must not simply start using the
+// correct name: the live cache would look empty. Renaming is a metadata-only
+// operation, so adopting gigabytes of cached reasoning is instant — copying
+// would block startup for minutes.
+//
+// An existing "reasoning_cache" table is archived rather than overwritten: on
+// databases created by the Python version it holds rows in a different format
+// (unix timestamps) that the age filter cannot read anyway, and keeping it
+// makes the migration lossless.
+func migrateLegacyCacheTable(ctx context.Context, db *bun.DB) error {
+	hasLegacy, err := tableExists(ctx, db, "reasoning_cache_entries")
+	if err != nil {
+		return err
+	}
+	if !hasLegacy {
+		return nil
+	}
+
+	hasCurrent, err := tableExists(ctx, db, "reasoning_cache")
+	if err != nil {
+		return err
+	}
+	if hasCurrent {
+		archive := "reasoning_cache_legacy_" + time.Now().UTC().Format("20060102T150405")
+		if _, err := db.ExecContext(ctx, "ALTER TABLE reasoning_cache RENAME TO "+archive); err != nil {
+			return fmt.Errorf("cannot archive legacy reasoning_cache table: %w", err)
+		}
+		log.Printf("cache: archived old reasoning_cache as %s (drop it and VACUUM to reclaim disk)", archive)
+	}
+
+	if _, err := db.ExecContext(ctx,
+		"ALTER TABLE reasoning_cache_entries RENAME TO reasoning_cache",
+	); err != nil {
+		return fmt.Errorf("cannot adopt reasoning_cache_entries table: %w", err)
+	}
+
+	// The index follows the archived table through the rename and would
+	// otherwise block creating one on the adopted table.
+	if _, err := db.ExecContext(ctx, "DROP INDEX IF EXISTS idx_reasoning_cache_created_at"); err != nil {
+		return fmt.Errorf("cannot drop stale reasoning cache index: %w", err)
+	}
+	log.Printf("cache: adopted reasoning_cache_entries as reasoning_cache")
+	return nil
+}
 
 // ReasoningStore provides a SQLite-backed cache for reasoning_content.
 type ReasoningStore struct {
@@ -84,6 +145,12 @@ func NewReasoningStore(
 		return nil, fmt.Errorf("cannot set busy timeout: %w", err)
 	}
 
+	// Adopt a table left behind by the old pluralized name before anything
+	// else touches the schema (see migrateLegacyCacheTable).
+	if err := migrateLegacyCacheTable(ctx, db); err != nil {
+		return nil, err
+	}
+
 	// Create table
 	if _, err := db.NewCreateTable().
 		Model((*models.ReasoningCacheEntry)(nil)).
@@ -92,7 +159,8 @@ func NewReasoningStore(
 		return nil, fmt.Errorf("cannot create reasoning_cache table: %w", err)
 	}
 
-	// Create index
+	// Create index. Index names are global in SQLite, so a stale index of the
+	// same name on an archived legacy table would shadow this one.
 	if _, err := db.ExecContext(ctx,
 		"CREATE INDEX IF NOT EXISTS idx_reasoning_cache_created_at ON reasoning_cache(created_at)",
 	); err != nil {
